@@ -1,19 +1,5 @@
 version: '3'
 
-# anchor_build: &anchor_build
-#   deps: []
-#   sources:
-#     - ./Taskfile.yml
-#     - ./**/*
-#   env:
-#     SOME_VAR: 0
-# vars:
-#   build_tool_bin: './build_tool/build_tool{{- if eq OS "windows" }}.exe{{ end -}}'
-# includes:
-#   subproject:
-#     taskfile: ./subproject/
-#     dir: ./subproject/
-
 tasks:
   build:
     sources:
