@@ -351,7 +351,12 @@ static void set_window_title(App *app, const char *title)
 static void usage(const char *argv0)
 {
 	fprintf(stderr, "piewin – XCB+Cairo fullscreen chooser\n");
-	fprintf(stderr, "Usage: echo -e \"A\\nB\\nC\" | %s\n", argv0);
+	fprintf(stderr, "Usage: echo -e \"A\\nB\\nC\" | %s [--keep-mouse-pos|-kmp]\n", argv0);
+	fprintf(stderr, "Options:\n");
+	fprintf(stderr, "  -h, --help            Show this help and exit\n");
+	fprintf(stderr, "  -kmp, --keep-mouse-pos\n");
+	fprintf(stderr, "                        Do not move the mouse pointer to screen center\n");
+	fprintf(stderr, "                        and do not restore it after exit.\n");
 }
 
 static void grab_input(App *app)
@@ -405,14 +410,26 @@ static void ungrab_input(App *app)
 
 int main(int argc, char **argv)
 {
-	if (argc > 1 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
-		usage(argv[0]);
-		return 0;
+	int keep_mouse_pos = 0;
+
+	// Args
+	for (int i = 1; i < argc; ++i) {
+		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+			usage(argv[0]);
+			return 0;
+		} else if (!strcmp(argv[i], "-kmp") || !strcmp(argv[i], "--keep-mouse-pos")) {
+			keep_mouse_pos = 1;
+		} else {
+			fprintf(stderr, "Unknown option: %s\n", argv[i]);
+			usage(argv[0]);
+			return 2;
+		}
 	}
 
 	DBG("[piewin] Debug logging enabled\n");
 	if (dbg_enabled()) {
 		fprintf(stderr, "[piewin] Cairo: %s\n", cairo_version_string());
+		fprintf(stderr, "[piewin] keep_mouse_pos=%d\n", keep_mouse_pos);
 	}
 
 	// Read entries from stdin (fast, simple)
@@ -511,6 +528,28 @@ int main(int argc, char **argv)
 	// Grab input so clicks/keys don't leak to other apps
 	grab_input(&app);
 
+	// Handle mouse position capture/center-warp on startup unless disabled
+	int saved_root_x = 0, saved_root_y = 0;
+	int saved_pos_valid = 0;
+	if (!keep_mouse_pos) {
+		xcb_query_pointer_cookie_t qpc = xcb_query_pointer(conn, screen->root);
+		xcb_query_pointer_reply_t *qpr = xcb_query_pointer_reply(conn, qpc, NULL);
+		if (qpr) {
+			saved_root_x = qpr->root_x;
+			saved_root_y = qpr->root_y;
+			saved_pos_valid = 1;
+			DBG("[piewin] Saved pointer at root %d,%d\n", saved_root_x, saved_root_y);
+			free(qpr);
+		} else {
+			DBG("[piewin] QueryPointer failed; will not restore position.\n");
+		}
+		int cx = app.width / 2;
+		int cy = app.height / 2;
+		DBG("[piewin] Warping pointer to center %d,%d\n", cx, cy);
+		xcb_warp_pointer(conn, XCB_NONE, screen->root, 0, 0, 0, 0, cx, cy);
+		xcb_flush(conn);
+	}
+
 	int hover_idx = -1;
 	int pressed_idx = -1;
 	DBG("[piewin] Initial draw %dx%d, entries=%zu\n", app.width, app.height, count);
@@ -607,8 +646,8 @@ int main(int argc, char **argv)
 					DBG("[piewin] CLIENT_MESSAGE type=%u data0=%u\n", cm->type, (unsigned)cm->data.data32[0]);
 					if (cm->type == app.WM_PROTOCOLS && (xcb_atom_t)cm->data.data32[0] == app.WM_DELETE_WINDOW) {
 						exit_code = 1;
-						running = 0;
 					}
+					running = 0;
 				}
 				break;
 
@@ -619,13 +658,23 @@ int main(int argc, char **argv)
 
 	// Cleanup
 	ungrab_input(&app);
+
+	// Destroy window (close) before restoring pointer position
+	if (app.win) xcb_destroy_window(conn, app.win);
+	xcb_flush(conn);
+
+	// Restore pointer position AFTER our window is closed, if we moved it
+	if (!keep_mouse_pos && saved_pos_valid) {
+		DBG("[piewin] Restoring pointer to saved root %d,%d\n", saved_root_x, saved_root_y);
+		xcb_warp_pointer(conn, XCB_NONE, app.screen->root, 0, 0, 0, 0, saved_root_x, saved_root_y);
+		xcb_flush(conn);
+	}
+
 	if (app.cr) cairo_destroy(app.cr);
 	if (app.csurf) cairo_surface_destroy(app.csurf);
 	if (app.bufcr) cairo_destroy(app.bufcr);
 	if (app.bufsurf) cairo_surface_destroy(app.bufsurf);
 	if (app.keysyms) xcb_key_symbols_free(app.keysyms);
-	if (app.win) xcb_destroy_window(conn, app.win);
-	xcb_flush(conn);
 	xcb_disconnect(conn);
 
 	for (size_t i = 0; i < count; ++i)
