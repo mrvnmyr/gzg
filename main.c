@@ -1,9 +1,14 @@
 // piewin: ultra-simple XCB + Cairo fullscreen chooser
 // Build: meson setup build && meson compile -C build
 // Usage: printf "One\nTwo\nThree\n" | ./build/piewin
+//
+// Notes:
+// - Compile fixes: enable POSIX prototypes for getline/strndup.
+// - Optional debug logging is enabled when the DEBUG env var is set.
+#define _POSIX_C_SOURCE 200809L
+
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
-#include <xcb/xcb_icccm.h>
 #include <xcb/xcb_keysyms.h>
 #include <cairo/cairo.h>
 #include <cairo/cairo-xcb.h>
@@ -13,6 +18,7 @@
 #include <math.h>
 #include <errno.h>
 #include <unistd.h>
+#include <stdint.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -20,6 +26,18 @@
 
 // XK_Escape without pulling in Xlib headers
 #define XK_Escape 0xff1b
+
+// --- Debug helper -------------------------------------------------------
+static int dbg_enabled(void) {
+  static int init = 0, on = 0;
+  if (!init) {
+    const char *d = getenv("DEBUG");
+    on = (d && *d && strcmp(d, "0") != 0) ? 1 : 0;
+    init = 1;
+  }
+  return on;
+}
+#define DBG(...) do { if (dbg_enabled()) fprintf(stderr, __VA_ARGS__); } while (0)
 
 typedef struct {
   char *text;
@@ -33,6 +51,9 @@ typedef struct {
   xcb_atom_t WM_DELETE_WINDOW;
   xcb_atom_t NET_WM_STATE;
   xcb_atom_t NET_WM_STATE_FULLSCREEN;
+  xcb_atom_t NET_WM_NAME;
+  xcb_atom_t WM_NAME_ATOM;
+  xcb_atom_t UTF8_STRING;
   xcb_key_symbols_t *keysyms;
   int width, height;
   cairo_surface_t *csurf;
@@ -157,7 +178,7 @@ static void draw(App *app, Entry *entries, int n, int hover_idx) {
 
   double step = (2.0 * M_PI) / (double)n;
   // Big radius so the arc is outside the window; ensures wedge fills to edges after clipping.
-  double R = hypot((double)W, (double)H); // center is in the middle; this is safely beyond all corners
+  double R = hypot((double)W, (double)H); // safely beyond all corners
 
   for (int i = 0; i < n; ++i) {
     double a0 = step * i;
@@ -219,6 +240,7 @@ static void recreate_cairo(App *app) {
   app->csurf = cairo_xcb_surface_create(app->conn, app->win, vt, app->width, app->height);
   app->cr = cairo_create(app->csurf);
   cairo_set_antialias(app->cr, CAIRO_ANTIALIAS_FAST);
+  DBG("[piewin] Recreated Cairo surface %dx%d\n", app->width, app->height);
 }
 
 static void set_fullscreen_hint(App *app) {
@@ -235,6 +257,19 @@ static void set_wm_delete_protocol(App *app) {
     xcb_change_property(app->conn, XCB_PROP_MODE_REPLACE, app->win,
                         app->WM_PROTOCOLS, XCB_ATOM_ATOM, 32, 1,
                         &app->WM_DELETE_WINDOW);
+  }
+}
+
+static void set_window_title(App *app, const char *title) {
+  // Prefer _NET_WM_NAME with UTF8_STRING, also set WM_NAME for compatibility.
+  if (app->NET_WM_NAME != XCB_NONE) {
+    xcb_atom_t type = (app->UTF8_STRING != XCB_NONE) ? app->UTF8_STRING : XCB_ATOM_STRING;
+    xcb_change_property(app->conn, XCB_PROP_MODE_REPLACE, app->win,
+                        app->NET_WM_NAME, type, 8, strlen(title), title);
+  }
+  if (app->WM_NAME_ATOM != XCB_NONE) {
+    xcb_change_property(app->conn, XCB_PROP_MODE_REPLACE, app->win,
+                        app->WM_NAME_ATOM, XCB_ATOM_STRING, 8, strlen(title), title);
   }
 }
 
@@ -266,12 +301,13 @@ int main(int argc, char **argv) {
     }
     entries[count].text = strndup(line, r);
     if (!entries[count].text) { perror("strndup"); return 1; }
+    DBG("[piewin] Read entry[%zu]: \"%s\"\n", count, entries[count].text);
     count++;
   }
   free(line);
 
   if (count == 0) {
-    // Nothing to choose from; exit with code 1 as per ESC semantics
+    DBG("[piewin] No entries on stdin; exiting 1\n");
     return 1;
   }
 
@@ -296,6 +332,9 @@ int main(int argc, char **argv) {
   app.WM_DELETE_WINDOW = intern_atom(conn, "WM_DELETE_WINDOW", 0);
   app.NET_WM_STATE = intern_atom(conn, "_NET_WM_STATE", 0);
   app.NET_WM_STATE_FULLSCREEN = intern_atom(conn, "_NET_WM_STATE_FULLSCREEN", 0);
+  app.NET_WM_NAME = intern_atom(conn, "_NET_WM_NAME", 0);
+  app.WM_NAME_ATOM = intern_atom(conn, "WM_NAME", 0);
+  app.UTF8_STRING = intern_atom(conn, "UTF8_STRING", 1);
   app.keysyms = xcb_key_symbols_alloc(conn);
 
   uint32_t event_mask =
@@ -319,10 +358,9 @@ int main(int argc, char **argv) {
                     XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK,
                     vals);
 
-  // Set properties
-  xcb_icccm_set_wm_name(conn, app.win, XCB_ATOM_STRING, 8, strlen("piewin"), "piewin");
   set_wm_delete_protocol(&app);
   set_fullscreen_hint(&app);
+  set_window_title(&app, "piewin");
 
   // Map and raise
   xcb_map_window(conn, app.win);
@@ -331,6 +369,7 @@ int main(int argc, char **argv) {
   recreate_cairo(&app);
 
   int hover_idx = -1;
+  DBG("[piewin] Initial draw %dx%d, entries=%zu\n", app.width, app.height, count);
   draw(&app, entries, (int)count, hover_idx);
 
   int exit_code = 1; // default to "cancel"
@@ -342,6 +381,7 @@ int main(int argc, char **argv) {
     uint8_t rt = ev->response_type & ~0x80;
     switch (rt) {
       case XCB_EXPOSE: {
+        DBG("[piewin] EXPOSE\n");
         draw(&app, entries, (int)count, hover_idx);
       } break;
 
@@ -349,6 +389,7 @@ int main(int argc, char **argv) {
         xcb_motion_notify_event_t *e = (xcb_motion_notify_event_t*)ev;
         int idx = sector_index_from_point((int)count, app.width, app.height, e->event_x, e->event_y);
         if (idx != hover_idx) {
+          DBG("[piewin] HOVER %d -> %d (x=%d y=%d)\n", hover_idx, idx, e->event_x, e->event_y);
           hover_idx = idx;
           draw(&app, entries, (int)count, hover_idx);
         }
@@ -356,12 +397,14 @@ int main(int argc, char **argv) {
 
       case XCB_BUTTON_PRESS: {
         xcb_button_press_event_t *e = (xcb_button_press_event_t*)ev;
+        DBG("[piewin] BUTTON_PRESS detail=%u at %d,%d\n", e->detail, e->event_x, e->event_y);
         if (e->detail == 1) { // left click
           int idx = sector_index_from_point((int)count, app.width, app.height, e->event_x, e->event_y);
           if (idx >= 0 && idx < (int)count) {
             // Output selected entry to stdout (single line)
             fprintf(stdout, "%s\n", entries[idx].text);
             fflush(stdout);
+            DBG("[piewin] SELECT idx=%d \"%s\"\n", idx, entries[idx].text);
             exit_code = 0;
             running = 0;
           }
@@ -371,6 +414,7 @@ int main(int argc, char **argv) {
       case XCB_KEY_PRESS: {
         xcb_key_press_event_t *e = (xcb_key_press_event_t*)ev;
         xcb_keysym_t sym = xcb_key_symbols_get_keysym(app.keysyms, e->detail, 0);
+        DBG("[piewin] KEY_PRESS detail=%u sym=0x%08x\n", e->detail, (unsigned)sym);
         if (sym == XK_Escape) {
           exit_code = 1;
           running = 0;
@@ -382,6 +426,7 @@ int main(int argc, char **argv) {
         if (e->width != app.width || e->height != app.height) {
           app.width = e->width;
           app.height = e->height;
+          DBG("[piewin] RESIZE -> %dx%d\n", app.width, app.height);
           recreate_cairo(&app);
           draw(&app, entries, (int)count, hover_idx);
         }
@@ -389,6 +434,7 @@ int main(int argc, char **argv) {
 
       case XCB_CLIENT_MESSAGE: {
         xcb_client_message_event_t *cm = (xcb_client_message_event_t*)ev;
+        DBG("[piewin] CLIENT_MESSAGE type=%u data0=%u\n", cm->type, (unsigned)cm->data.data32[0]);
         if (cm->type == app.WM_PROTOCOLS && (xcb_atom_t)cm->data.data32[0] == app.WM_DELETE_WINDOW) {
           exit_code = 1;
           running = 0;
@@ -410,5 +456,6 @@ int main(int argc, char **argv) {
 
   for (size_t i = 0; i < count; ++i) free(entries[i].text);
   free(entries);
+  DBG("[piewin] Exit code %d\n", exit_code);
   return exit_code;
 }
