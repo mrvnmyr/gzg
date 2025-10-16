@@ -62,8 +62,10 @@ typedef struct
 	xcb_atom_t UTF8_STRING;
 	xcb_key_symbols_t *keysyms;
 	int width, height;
-	cairo_surface_t *csurf;
-	cairo_t *cr;
+	cairo_surface_t *csurf;   // XCB surface (window)
+	cairo_t *cr;               // XCB surface context
+	cairo_surface_t *bufsurf;  // offscreen back buffer
+	cairo_t *bufcr;            // offscreen context
 } App;
 
 static xcb_visualtype_t *find_visualtype(const xcb_screen_t *screen, xcb_visualid_t vid)
@@ -194,12 +196,13 @@ static double fit_font_size(cairo_t *cr, const char *text, double maxw, double m
 
 static void draw(App *app, Entry *entries, int n, int hover_idx)
 {
-	cairo_t *cr = app->cr;
 	int W = app->width, H = app->height;
 	double cx = W * 0.5, cy = H * 0.5;
 
+	cairo_t *cr = app->bufcr;          // draw into back buffer
 	cairo_save(cr);
-	// Clear
+
+	// Clear back buffer
 	cairo_set_source_rgb(cr, 0.08, 0.08, 0.10);
 	cairo_rectangle(cr, 0, 0, W, H);
 	cairo_fill(cr);
@@ -215,6 +218,11 @@ static void draw(App *app, Entry *entries, int n, int hover_idx)
 		cairo_move_to(cr, cx - (ext.width * 0.5 + ext.x_bearing), cy - (ext.height * 0.5 + ext.y_bearing));
 		cairo_show_text(cr, msg);
 		cairo_restore(cr);
+
+		// Blit back buffer to the window in one go
+		cairo_set_source_surface(app->cr, app->bufsurf, 0, 0);
+		cairo_set_operator(app->cr, CAIRO_OPERATOR_SOURCE);
+		cairo_paint(app->cr);
 		cairo_surface_flush(app->csurf);
 		xcb_flush(app->conn);
 		return;
@@ -273,6 +281,12 @@ static void draw(App *app, Entry *entries, int n, int hover_idx)
 	}
 
 	cairo_restore(cr);
+
+	// Blit back buffer to the window in one go (reduces artifacts)
+	cairo_set_source_surface(app->cr, app->bufsurf, 0, 0);
+	cairo_set_operator(app->cr, CAIRO_OPERATOR_SOURCE);
+	cairo_paint(app->cr);
+
 	cairo_surface_flush(app->csurf);
 	xcb_flush(app->conn);
 }
@@ -287,11 +301,24 @@ static void recreate_cairo(App *app)
 		cairo_surface_destroy(app->csurf);
 		app->csurf = NULL;
 	}
+	if (app->bufcr) {
+		cairo_destroy(app->bufcr);
+		app->bufcr = NULL;
+	}
+	if (app->bufsurf) {
+		cairo_surface_destroy(app->bufsurf);
+		app->bufsurf = NULL;
+	}
 	xcb_visualtype_t *vt = find_visualtype(app->screen, app->screen->root_visual);
 	app->csurf = cairo_xcb_surface_create(app->conn, app->win, vt, app->width, app->height);
 	app->cr = cairo_create(app->csurf);
 	cairo_set_antialias(app->cr, CAIRO_ANTIALIAS_FAST);
-	DBG("[piewin] Recreated Cairo surface %dx%d\n", app->width, app->height);
+
+	app->bufsurf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, app->width, app->height);
+	app->bufcr = cairo_create(app->bufsurf);
+	cairo_set_antialias(app->bufcr, CAIRO_ANTIALIAS_FAST);
+
+	DBG("[piewin] Recreated Cairo surfaces %dx%d (double-buffer)\n", app->width, app->height);
 }
 
 static void set_fullscreen_hint(App *app)
@@ -325,6 +352,55 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr, "piewin – XCB+Cairo fullscreen chooser\n");
 	fprintf(stderr, "Usage: echo -e \"A\\nB\\nC\" | %s\n", argv0);
+}
+
+static void grab_input(App *app)
+{
+	// Grab pointer to avoid click-through to underlying apps.
+	xcb_grab_pointer_cookie_t pc =
+	    xcb_grab_pointer(app->conn,
+	                     0,                 // owner_events
+	                     app->win,          // grab on our window
+	                     XCB_EVENT_MASK_BUTTON_PRESS |
+	                         XCB_EVENT_MASK_BUTTON_RELEASE |
+	                         XCB_EVENT_MASK_POINTER_MOTION,
+	                     XCB_GRAB_MODE_ASYNC,
+	                     XCB_GRAB_MODE_ASYNC,
+	                     app->win,          // confine_to
+	                     XCB_NONE,          // cursor
+	                     XCB_CURRENT_TIME);
+	xcb_grab_pointer_reply_t *pr = xcb_grab_pointer_reply(app->conn, pc, NULL);
+	if (pr) {
+		DBG("[piewin] Grab pointer status=%u\n", pr->status);
+		free(pr);
+	} else {
+		DBG("[piewin] Grab pointer: no reply\n");
+	}
+
+	// Also grab keyboard so Esc doesn't leak.
+	xcb_grab_keyboard_cookie_t kc =
+	    xcb_grab_keyboard(app->conn,
+	                      0,
+	                      app->win,
+	                      XCB_CURRENT_TIME,
+	                      XCB_GRAB_MODE_ASYNC,
+	                      XCB_GRAB_MODE_ASYNC);
+	xcb_grab_keyboard_reply_t *kr = xcb_grab_keyboard_reply(app->conn, kc, NULL);
+	if (kr) {
+		DBG("[piewin] Grab keyboard status=%u\n", kr->status);
+		free(kr);
+	} else {
+		DBG("[piewin] Grab keyboard: no reply\n");
+	}
+	xcb_flush(app->conn);
+}
+
+static void ungrab_input(App *app)
+{
+	xcb_ungrab_pointer(app->conn, XCB_CURRENT_TIME);
+	xcb_ungrab_keyboard(app->conn, XCB_CURRENT_TIME);
+	xcb_flush(app->conn);
+	DBG("[piewin] Ungrab input\n");
 }
 
 int main(int argc, char **argv)
@@ -387,12 +463,12 @@ int main(int argc, char **argv)
 		xcb_screen_next(&it);
 	xcb_screen_t *screen = it.data;
 	DBG("[piewin] Connected to X server: screen=%d size=%dx%d root=0x%08x\n",
-		scrno,
-		screen->width_in_pixels,
-		screen->height_in_pixels,
-		(unsigned)screen->root);
+	    scrno,
+	    screen->width_in_pixels,
+	    screen->height_in_pixels,
+	    (unsigned)screen->root);
 
-	App app = {0};
+	App app = (App){0};
 	app.conn = conn;
 	app.screen = screen;
 	app.width = screen->width_in_pixels;
@@ -407,7 +483,12 @@ int main(int argc, char **argv)
 	app.keysyms = xcb_key_symbols_alloc(conn);
 
 	uint32_t event_mask =
-		XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_KEY_PRESS;
+		XCB_EVENT_MASK_EXPOSURE |
+		XCB_EVENT_MASK_STRUCTURE_NOTIFY |
+		XCB_EVENT_MASK_BUTTON_PRESS |
+		XCB_EVENT_MASK_BUTTON_RELEASE |
+		XCB_EVENT_MASK_POINTER_MOTION |
+		XCB_EVENT_MASK_KEY_PRESS;
 
 	uint32_t vals[2];
 	vals[0] = screen->black_pixel;
@@ -424,9 +505,14 @@ int main(int argc, char **argv)
 	xcb_map_window(conn, app.win);
 	xcb_flush(conn);
 
+	// Create cairo surfaces (includes back buffer)
 	recreate_cairo(&app);
 
+	// Grab input so clicks/keys don't leak to other apps
+	grab_input(&app);
+
 	int hover_idx = -1;
+	int pressed_idx = -1;
 	DBG("[piewin] Initial draw %dx%d, entries=%zu\n", app.width, app.height, count);
 	draw(&app, entries, (int)count, hover_idx);
 
@@ -461,10 +547,22 @@ int main(int argc, char **argv)
 				{
 					xcb_button_press_event_t *e = (xcb_button_press_event_t *)ev;
 					DBG("[piewin] BUTTON_PRESS detail=%u at %d,%d\n", e->detail, e->event_x, e->event_y);
-					if (e->detail == 1) {  // left click
+					if (e->detail == 1) {  // left button
+						pressed_idx = sector_index_from_point((int)count, app.width, app.height, e->event_x, e->event_y);
+						DBG("[piewin] PRESS on idx=%d\n", pressed_idx);
+					}
+				}
+				break;
+
+			case XCB_BUTTON_RELEASE:
+				{
+					xcb_button_release_event_t *e = (xcb_button_release_event_t *)ev;
+					DBG("[piewin] BUTTON_RELEASE detail=%u at %d,%d\n", e->detail, e->event_x, e->event_y);
+					if (e->detail == 1) {  // left button release confirms selection
 						int idx = sector_index_from_point((int)count, app.width, app.height, e->event_x, e->event_y);
+						DBG("[piewin] RELEASE on idx=%d (pressed=%d)\n", idx, pressed_idx);
+						// Select based on release location (common UX)
 						if (idx >= 0 && idx < (int)count) {
-							// Output selected entry to stdout (single line)
 							fprintf(stdout, "%s\n", entries[idx].text);
 							fflush(stdout);
 							DBG("[piewin] SELECT idx=%d \"%s\"\n", idx, entries[idx].text);
@@ -472,6 +570,7 @@ int main(int argc, char **argv)
 							running = 0;
 						}
 					}
+					pressed_idx = -1;
 				}
 				break;
 
@@ -490,7 +589,7 @@ int main(int argc, char **argv)
 			case XCB_CONFIGURE_NOTIFY:
 				{
 					xcb_configure_notify_event_t *e = (xcb_configure_notify_event_t *)ev;
-					if (e->width != app.width || e->height != app.height) {
+					if (e->width != app->width || e->height != app->height) {
 						app.width = e->width;
 						app.height = e->height;
 						DBG("[piewin] RESIZE -> %dx%d\n", app.width, app.height);
@@ -517,8 +616,11 @@ int main(int argc, char **argv)
 	}
 
 	// Cleanup
+	ungrab_input(&app);
 	if (app.cr) cairo_destroy(app.cr);
 	if (app.csurf) cairo_surface_destroy(app.csurf);
+	if (app.bufcr) cairo_destroy(app.bufcr);
+	if (app.bufsurf) cairo_surface_destroy(app.bufsurf);
 	if (app.keysyms) xcb_key_symbols_free(app.keysyms);
 	if (app.win) xcb_destroy_window(conn, app.win);
 	xcb_flush(conn);
