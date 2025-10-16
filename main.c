@@ -513,7 +513,6 @@ int main(int argc, char **argv)
 
 	int hover_idx = -1;
 	int pressed_idx = -1;
-	int wait_release_button = 0; // if 1, we've selected and are swallowing release
 	DBG("[piewin] Initial draw %dx%d, entries=%zu\n", app.width, app.height, count);
 	draw(&app, entries, (int)count, hover_idx);
 
@@ -524,14 +523,6 @@ int main(int argc, char **argv)
 		xcb_generic_event_t *ev = xcb_wait_for_event(conn);
 		if (!ev) break;
 		uint8_t rt = ev->response_type & ~0x80;
-
-		// If we've already selected and unmapped, ignore everything except the matching release and WM messages.
-		if (wait_release_button &&
-		    !(rt == XCB_BUTTON_RELEASE || rt == XCB_CLIENT_MESSAGE)) {
-			DBG("[piewin] Post-select: ignoring event type=%u\n", rt);
-			free(ev);
-			continue;
-		}
 
 		switch (rt) {
 			case XCB_EXPOSE:
@@ -556,24 +547,18 @@ int main(int argc, char **argv)
 			case XCB_BUTTON_PRESS:
 				{
 					xcb_button_press_event_t *e = (xcb_button_press_event_t *)ev;
-					DBG("[piewin] BUTTON_PRESS detail=%u at %d,%d (wait_release=%d)\n",
-					    e->detail, e->event_x, e->event_y, wait_release_button);
-					if (e->detail == 1 && !wait_release_button) {  // left button
+					DBG("[piewin] BUTTON_PRESS detail=%u at %d,%d\n",
+					    e->detail, e->event_x, e->event_y);
+					if (e->detail == 1) {  // left button
 						pressed_idx = sector_index_from_point((int)count, app.width, app.height, e->event_x, e->event_y);
-						DBG("[piewin] PRESS on idx=%d -> SELECT NOW, unmap window immediately\n", pressed_idx);
+						DBG("[piewin] PRESS on idx=%d -> SELECT & EXIT NOW\n", pressed_idx);
 						if (pressed_idx >= 0 && pressed_idx < (int)count) {
 							// Output selected entry to stdout immediately on press
 							fprintf(stdout, "%s\n", entries[pressed_idx].text);
 							fflush(stdout);
 							DBG("[piewin] SELECT idx=%d \"%s\"\n", pressed_idx, entries[pressed_idx].text);
 							exit_code = 0;
-
-							// Hide window immediately but keep grab until release arrives to swallow it.
-							xcb_unmap_window(conn, app.win);
-							xcb_flush(conn);
-							DBG("[piewin] Window unmapped; waiting for ButtonRelease to exit cleanly.\n");
-
-							wait_release_button = 1;
+							running = 0; // immediate termination requested
 						}
 					}
 				}
@@ -582,14 +567,8 @@ int main(int argc, char **argv)
 			case XCB_BUTTON_RELEASE:
 				{
 					xcb_button_release_event_t *e = (xcb_button_release_event_t *)ev;
-					DBG("[piewin] BUTTON_RELEASE detail=%u at %d,%d (wait_release=%d)\n",
-					    e->detail, e->event_x, e->event_y, wait_release_button);
-					if (e->detail == 1) {  // left button release
-						if (wait_release_button) {
-							DBG("[piewin] RELEASE received after selection; exiting now.\n");
-							running = 0; // now it's safe to exit/ungrab without leaking release
-						}
-					}
+					DBG("[piewin] BUTTON_RELEASE detail=%u at %d,%d\n",
+					    e->detail, e->event_x, e->event_y);
 					pressed_idx = -1;
 				}
 				break;
