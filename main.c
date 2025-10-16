@@ -387,10 +387,10 @@ int main(int argc, char **argv)
 		xcb_screen_next(&it);
 	xcb_screen_t *screen = it.data;
 	DBG("[piewin] Connected to X server: screen=%d size=%dx%d root=0x%08x\n",
-	    scrno,
-	    screen->width_in_pixels,
-	    screen->height_in_pixels,
-	    (unsigned)screen->root);
+		scrno,
+		screen->width_in_pixels,
+		screen->height_in_pixels,
+		(unsigned)screen->root);
 
 	App app = {0};
 	app.conn = conn;
