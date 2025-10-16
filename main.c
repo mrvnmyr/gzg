@@ -579,7 +579,8 @@ int main(int argc, char **argv)
 					xcb_key_press_event_t *e = (xcb_key_press_event_t *)ev;
 					xcb_keysym_t sym = xcb_key_symbols_get_keysym(app.keysyms, e->detail, 0);
 					DBG("[piewin] KEY_PRESS detail=%u sym=0x%08x\n", e->detail, (unsigned)sym);
-					if (sym == XK_Escape) {
+					if (sym == XK_Escape || sym == 'q' || sym == 'Q') {
+						DBG("[piewin] Quit key pressed (sym=0x%08x)\n", (unsigned)sym);
 						exit_code = 1;
 						running = 0;
 					}
@@ -589,10 +590,12 @@ int main(int argc, char **argv)
 			case XCB_CONFIGURE_NOTIFY:
 				{
 					xcb_configure_notify_event_t *e = (xcb_configure_notify_event_t *)ev;
-					if (e->width != app->width || e->height != app->height) {
+					DBG("[piewin] CONFIGURE_NOTIFY w=%u h=%u (cur=%d,%d)\n",
+					    e->width, e->height, app.width, app.height);
+					if (e->width != app.width || e->height != app.height) {
 						app.width = e->width;
 						app.height = e->height;
-						DBG("[piewin] RESIZE -> %dx%d\n", app.width, app.height);
+						DBG("[piewin] RESIZE -> %dx%d (recreate surfaces)\n", app.width, app.height);
 						recreate_cairo(&app);
 						draw(&app, entries, (int)count, hover_idx);
 					}
