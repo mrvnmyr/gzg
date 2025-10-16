@@ -1,0 +1,26 @@
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.{c,cc,cpp,h,hh,hpp}]
+indent_size = 3
+
+[meson.build]
+indent_style = tab
+indent_size = 4
+
+# serialization & markup
+
+[*.{json,jsonl,json5}]
+indent_size = 2
+
+[*.{yaml,yml}]
+indent_size = 2
+
+[*.md]
+indent_style = tab
+trim_trailing_whitespace = false
