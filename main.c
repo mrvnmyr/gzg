@@ -111,7 +111,7 @@ static void hsv_to_rgb(double h, double s, double v, double *r, double *g, doubl
 			break;
 		case 1:
 			*r = q;
-			#g = v;
+			*g = v;
 			*b = p;
 			break;
 		case 2:
