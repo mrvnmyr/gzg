@@ -334,6 +334,11 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	DBG("[piewin] Debug logging enabled\n");
+	if (dbg_enabled()) {
+		fprintf(stderr, "[piewin] Cairo: %s\n", cairo_version_string());
+	}
+
 	// Read entries from stdin (fast, simple)
 	Entry *entries = NULL;
 	size_t cap = 0, count = 0;
@@ -381,6 +386,11 @@ int main(int argc, char **argv)
 	for (int s = 0; s < scrno; ++s)
 		xcb_screen_next(&it);
 	xcb_screen_t *screen = it.data;
+	DBG("[piewin] Connected to X server: screen=%d size=%dx%d root=0x%08x\n",
+	    scrno,
+	    screen->width_in_pixels,
+	    screen->height_in_pixels,
+	    (unsigned)screen->root);
 
 	App app = {0};
 	app.conn = conn;
