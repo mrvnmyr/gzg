@@ -427,10 +427,11 @@ static void ungrab_input(App *app)
 }
 
 // --- Screenshot helper ---------------------------------------------------
-static cairo_status_t free_user_data(void *data)
+// Must match cairo_destroy_func_t (void (*)(void*))
+static void free_user_data(void *data)
 {
+	DBG("[piewin] Freeing screenshot buffer\n");
 	free(data);
-	return CAIRO_STATUS_SUCCESS;
 }
 
 static cairo_surface_t *capture_dimmed_screenshot_with_cursor(App *app, int mouse_x, int mouse_y, int have_pos)
@@ -488,6 +489,7 @@ static cairo_surface_t *capture_dimmed_screenshot_with_cursor(App *app, int mous
 		return NULL;
 	}
 	cairo_surface_set_user_data(img, &KEY_FREE, dst, free_user_data);
+	DBG("[piewin] Screenshot surface created and user data hook set\n");
 
 	// Dim and draw cursor mark directly onto the image once
 	cairo_t *tcr = cairo_create(img);
