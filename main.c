@@ -1,6 +1,6 @@
 // piewin: ultra-simple XCB + Cairo fullscreen chooser
 // Build: meson setup build && meson compile -C build
-// Usage: printf "One\nTwo\nThree\n" | ./build/piewin
+// Usage: printf "One\nTwo\nThree\n" | ./build/gzg
 //
 // Notes:
 // - Compile fixes: enable POSIX prototypes for getline/strndup.
@@ -66,6 +66,10 @@ typedef struct
 	cairo_t *cr;               // XCB surface context
 	cairo_surface_t *bufsurf;  // offscreen back buffer
 	cairo_t *bufcr;            // offscreen context
+
+	// Background screenshot (optional)
+	cairo_surface_t *bg_image;
+	int bg_w, bg_h;
 } App;
 
 static xcb_visualtype_t *find_visualtype(const xcb_screen_t *screen, xcb_visualid_t vid)
@@ -202,10 +206,21 @@ static void draw(App *app, Entry *entries, int n, int hover_idx)
 	cairo_t *cr = app->bufcr;          // draw into back buffer
 	cairo_save(cr);
 
-	// Clear back buffer
-	cairo_set_source_rgb(cr, 0.08, 0.08, 0.10);
-	cairo_rectangle(cr, 0, 0, W, H);
-	cairo_fill(cr);
+	// Background: screenshot if available, else solid
+	if (app->bg_image) {
+		cairo_save(cr);
+		double sx = (double)W / (double)app->bg_w;
+		double sy = (double)H / (double)app->bg_h;
+		cairo_scale(cr, sx, sy);
+		cairo_set_source_surface(cr, app->bg_image, 0, 0);
+		cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_FAST);
+		cairo_paint(cr);
+		cairo_restore(cr);
+	} else {
+		cairo_set_source_rgb(cr, 0.08, 0.08, 0.10);
+		cairo_rectangle(cr, 0, 0, W, H);
+		cairo_fill(cr);
+	}
 
 	if (n <= 0) {
 		cairo_set_source_rgb(cr, 0.9, 0.2, 0.2);
@@ -236,11 +251,12 @@ static void draw(App *app, Entry *entries, int n, int hover_idx)
 		double a0 = step * i;
 		double a1 = step * (i + 1);
 
-		// Fill wedge
+		// Fill wedge (semi-transparent over background)
 		double r, g, b;
-		double base_v = (i == hover_idx) ? 0.85 : 0.62;
+		double base_v = (i == hover_idx) ? 0.95 : 0.75;
 		hsv_to_rgb((double)i / (double)n, 0.55, base_v, &r, &g, &b);
-		cairo_set_source_rgb(cr, r, g, b);
+		double alpha = (i == hover_idx) ? 0.80 : 0.55;
+		cairo_set_source_rgba(cr, r, g, b, alpha);
 
 		cairo_new_path(cr);
 		cairo_move_to(cr, cx, cy);
@@ -268,14 +284,14 @@ static void draw(App *app, Entry *entries, int n, int hover_idx)
 		cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
 		double fs = fit_font_size(cr, txt, avail_w, avail_h);
 		cairo_set_font_size(cr, fs);
-		cairo_set_source_rgb(cr, 0.05, 0.05, 0.07);  // drop shadow
+		cairo_set_source_rgba(cr, 0.05, 0.05, 0.07, 0.9);  // drop shadow
 		cairo_text_extents_t ext;
 		cairo_text_extents(cr, txt, &ext);
 		double tx = px - (ext.width * 0.5 + ext.x_bearing);
 		double ty = py - (ext.height * 0.5 + ext.y_bearing);
 		cairo_move_to(cr, tx + 1.5, ty + 1.5);
 		cairo_show_text(cr, txt);
-		cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+		cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
 		cairo_move_to(cr, tx, ty);
 		cairo_show_text(cr, txt);
 	}
@@ -350,13 +366,15 @@ static void set_window_title(App *app, const char *title)
 
 static void usage(const char *argv0)
 {
-	fprintf(stderr, "piewin – XCB+Cairo fullscreen chooser\n");
-	fprintf(stderr, "Usage: echo -e \"A\\nB\\nC\" | %s [--keep-mouse-pos|-kmp]\n", argv0);
+	fprintf(stderr, "gzg – XCB+Cairo fullscreen chooser\n");
+	fprintf(stderr, "Usage: echo -e \"A\\nB\\nC\" | %s [options]\n", argv0);
 	fprintf(stderr, "Options:\n");
 	fprintf(stderr, "  -h, --help            Show this help and exit\n");
 	fprintf(stderr, "  -kmp, --keep-mouse-pos\n");
 	fprintf(stderr, "                        Do not move the mouse pointer to screen center\n");
 	fprintf(stderr, "                        and do not restore it after exit.\n");
+	fprintf(stderr, "  -s, --screenshot      Use a dimmed screenshot as background and mark\n");
+	fprintf(stderr, "                        the original cursor position with a red circle.\n");
 }
 
 static void grab_input(App *app)
@@ -408,9 +426,107 @@ static void ungrab_input(App *app)
 	DBG("[piewin] Ungrab input\n");
 }
 
+// --- Screenshot helper ---------------------------------------------------
+static cairo_status_t free_user_data(void *data)
+{
+	free(data);
+	return CAIRO_STATUS_SUCCESS;
+}
+
+static cairo_surface_t *capture_dimmed_screenshot_with_cursor(App *app, int mouse_x, int mouse_y, int have_pos)
+{
+	int W = app->width, H = app->height;
+	DBG("[piewin] Capturing screenshot of %dx%d (root=0x%08x)\n", W, H, (unsigned)app->screen->root);
+	xcb_get_image_cookie_t ck =
+	    xcb_get_image(app->conn, XCB_IMAGE_FORMAT_Z_PIXMAP, app->screen->root,
+	                  0, 0, W, H, ~0u);
+	xcb_get_image_reply_t *rep = xcb_get_image_reply(app->conn, ck, NULL);
+	if (!rep) {
+		DBG("[piewin] xcb_get_image failed; no background will be used.\n");
+		return NULL;
+	}
+	uint8_t *src = xcb_get_image_data(rep);
+	uint32_t data_len = xcb_get_image_data_length(rep);
+	int pixels = W * H;
+	int bpp = (pixels > 0) ? (int)(data_len / pixels) : 0;
+	DBG("[piewin] Screenshot depth=%u bpp=%d data_len=%u\n", rep->depth, bpp, data_len);
+
+	// Convert to 32bpp RGB24 buffer for Cairo.
+	int stride = W * 4;
+	uint32_t *dst = (uint32_t *)malloc((size_t)stride * H);
+	if (!dst) {
+		DBG("[piewin] malloc failed for screenshot buffer\n");
+		free(rep);
+		return NULL;
+	}
+
+	if (bpp >= 4) {
+		// Fast path: copy as 32bpp
+		memcpy(dst, src, (size_t)stride * H);
+	} else if (bpp == 3) {
+		// Expand 24bpp to 32bpp (assume src order B,G,R)
+		for (int i = 0, si = 0; i < pixels; ++i, si += 3) {
+			uint8_t B = src[si + 0];
+			uint8_t G = src[si + 1];
+			uint8_t R = src[si + 2];
+			dst[i] = ((uint32_t)R << 16) | ((uint32_t)G << 8) | (uint32_t)B;
+		}
+	} else {
+		DBG("[piewin] Unsupported bpp=%d for screenshot; disabling.\n", bpp);
+		free(dst);
+		free(rep);
+		return NULL;
+	}
+	free(rep);
+
+	static cairo_user_data_key_t KEY_FREE;
+	cairo_surface_t *img = cairo_image_surface_create_for_data(
+	    (unsigned char *)dst, CAIRO_FORMAT_RGB24, W, H, stride);
+	if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
+		DBG("[piewin] cairo_image_surface_create_for_data failed\n");
+		free(dst);
+		return NULL;
+	}
+	cairo_surface_set_user_data(img, &KEY_FREE, dst, free_user_data);
+
+	// Dim and draw cursor mark directly onto the image once
+	cairo_t *tcr = cairo_create(img);
+	// Dim brightness with translucent black
+	cairo_set_source_rgba(tcr, 0.0, 0.0, 0.0, 0.40);
+	cairo_rectangle(tcr, 0, 0, W, H);
+	cairo_fill(tcr);
+
+	if (have_pos) {
+		double r = 16.0; // 32x32 diameter
+		double cx = (double)mouse_x;
+		double cy = (double)mouse_y;
+		DBG("[piewin] Drawing cursor marker at %d,%d\n", mouse_x, mouse_y);
+
+		// Soft halo
+		cairo_set_source_rgba(tcr, 0.0, 0.0, 0.0, 0.35);
+		cairo_arc(tcr, cx, cy, r + 3.0, 0, 2 * M_PI);
+		cairo_fill(tcr);
+
+		// Fill red
+		cairo_set_source_rgba(tcr, 1.0, 0.1, 0.1, 0.9);
+		cairo_arc(tcr, cx, cy, r, 0, 2 * M_PI);
+		cairo_fill(tcr);
+
+		// Outline
+		cairo_set_source_rgba(tcr, 1.0, 1.0, 1.0, 0.9);
+		cairo_set_line_width(tcr, 2.0);
+		cairo_arc(tcr, cx, cy, r, 0, 2 * M_PI);
+		cairo_stroke(tcr);
+	}
+	cairo_destroy(tcr);
+
+	return img;
+}
+
 int main(int argc, char **argv)
 {
 	int keep_mouse_pos = 0;
+	int use_screenshot_bg = 0;
 
 	// Args
 	for (int i = 1; i < argc; ++i) {
@@ -419,6 +535,8 @@ int main(int argc, char **argv)
 			return 0;
 		} else if (!strcmp(argv[i], "-kmp") || !strcmp(argv[i], "--keep-mouse-pos")) {
 			keep_mouse_pos = 1;
+		} else if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--screenshot")) {
+			use_screenshot_bg = 1;
 		} else {
 			fprintf(stderr, "Unknown option: %s\n", argv[i]);
 			usage(argv[0]);
@@ -429,7 +547,7 @@ int main(int argc, char **argv)
 	DBG("[piewin] Debug logging enabled\n");
 	if (dbg_enabled()) {
 		fprintf(stderr, "[piewin] Cairo: %s\n", cairo_version_string());
-		fprintf(stderr, "[piewin] keep_mouse_pos=%d\n", keep_mouse_pos);
+		fprintf(stderr, "[piewin] keep_mouse_pos=%d screenshot=%d\n", keep_mouse_pos, use_screenshot_bg);
 	}
 
 	// Read entries from stdin (fast, simple)
@@ -499,6 +617,35 @@ int main(int argc, char **argv)
 	app.UTF8_STRING = intern_atom(conn, "UTF8_STRING", 1);
 	app.keysyms = xcb_key_symbols_alloc(conn);
 
+	// Always query pointer to know original position (for screenshot marker and/or restore)
+	int saved_root_x = 0, saved_root_y = 0;
+	int saved_pos_valid = 0;
+	{
+		xcb_query_pointer_cookie_t qpc = xcb_query_pointer(conn, screen->root);
+		xcb_query_pointer_reply_t *qpr = xcb_query_pointer_reply(conn, qpc, NULL);
+		if (qpr) {
+			saved_root_x = qpr->root_x;
+			saved_root_y = qpr->root_y;
+			saved_pos_valid = 1;
+			DBG("[piewin] Initial pointer at root %d,%d\n", saved_root_x, saved_root_y);
+			free(qpr);
+		} else {
+			DBG("[piewin] QueryPointer failed.\n");
+		}
+	}
+
+	// Capture screenshot BEFORE creating/mapping our window (to avoid capturing ourselves)
+	if (use_screenshot_bg) {
+		app.bg_w = app.width;
+		app.bg_h = app.height;
+		app.bg_image = capture_dimmed_screenshot_with_cursor(&app,
+		                                                     saved_root_x, saved_root_y,
+		                                                     saved_pos_valid);
+		if (!app.bg_image) {
+			DBG("[piewin] Screenshot not available; falling back to solid background.\n");
+		}
+	}
+
 	uint32_t event_mask =
 		XCB_EVENT_MASK_EXPOSURE |
 		XCB_EVENT_MASK_STRUCTURE_NOTIFY |
@@ -516,7 +663,7 @@ int main(int argc, char **argv)
 
 	set_wm_delete_protocol(&app);
 	set_fullscreen_hint(&app);
-	set_window_title(&app, "piewin");
+	set_window_title(&app, "gzg");
 
 	// Map and raise
 	xcb_map_window(conn, app.win);
@@ -528,21 +675,8 @@ int main(int argc, char **argv)
 	// Grab input so clicks/keys don't leak to other apps
 	grab_input(&app);
 
-	// Handle mouse position capture/center-warp on startup unless disabled
-	int saved_root_x = 0, saved_root_y = 0;
-	int saved_pos_valid = 0;
+	// Handle pointer warp unless disabled
 	if (!keep_mouse_pos) {
-		xcb_query_pointer_cookie_t qpc = xcb_query_pointer(conn, screen->root);
-		xcb_query_pointer_reply_t *qpr = xcb_query_pointer_reply(conn, qpc, NULL);
-		if (qpr) {
-			saved_root_x = qpr->root_x;
-			saved_root_y = qpr->root_y;
-			saved_pos_valid = 1;
-			DBG("[piewin] Saved pointer at root %d,%d\n", saved_root_x, saved_root_y);
-			free(qpr);
-		} else {
-			DBG("[piewin] QueryPointer failed; will not restore position.\n");
-		}
 		int cx = app.width / 2;
 		int cy = app.height / 2;
 		DBG("[piewin] Warping pointer to center %d,%d\n", cx, cy);
@@ -674,6 +808,7 @@ int main(int argc, char **argv)
 	if (app.csurf) cairo_surface_destroy(app.csurf);
 	if (app.bufcr) cairo_destroy(app.bufcr);
 	if (app.bufsurf) cairo_surface_destroy(app.bufsurf);
+	if (app.bg_image) cairo_surface_destroy(app.bg_image);
 	if (app.keysyms) xcb_key_symbols_free(app.keysyms);
 	xcb_disconnect(conn);
 
