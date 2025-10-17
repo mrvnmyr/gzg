@@ -19,4 +19,7 @@ build)
         ninja -C build -t compdb >compile_commands.json
     fi
     ;;
+clean)
+    rm -rf ./build
+    ;;
 esac

@@ -1,4 +1,4 @@
-project('piewin', 'c',
+project('gzg', 'c',
   version: '0.1.0',
   default_options: ['c_std=c11', 'warning_level=2'])
 
@@ -9,7 +9,7 @@ xcb_dep = dependency('xcb', required: true)
 cairo_dep = dependency('cairo', required: true)
 xcb_keysyms_dep = dependency('xcb-keysyms', required: true)
 
-exe = executable('piewin', 'main.c',
+exe = executable('gzg', 'main.c',
   dependencies: [xcb_dep, cairo_dep, xcb_keysyms_dep, m_dep],
   install: false)
 

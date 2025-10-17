@@ -8,6 +8,6 @@ tasks:
       - build.sh
       - meson.build
     generates:
-      - ./build/piewin
+      - ./build/gzg
     cmds:
       - ./dev.sh build
