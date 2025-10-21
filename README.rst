@@ -34,6 +34,8 @@ Notes
 - **Keyboard navigation:** Arrow keys and ``hjkl`` cycle through entries; **Enter**
   chooses the highlighted entry; **Esc** cancels. To disable all keyboard handling,
   pass ``-nkb`` / ``--no-keyboard`` (mouse-only).
+- **Auto-close on workspace switch:** if the window is unmapped by the WM
+  (e.g. switching workspaces in i3wm), the program exits automatically.
 - Extra debug prints are available when the ``DEBUG`` environment variable is
   set to a non-empty and non-``0`` value.
 

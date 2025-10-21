@@ -925,6 +925,19 @@ int main(int argc, char **argv)
 				}
 				break;
 
+			case XCB_UNMAP_NOTIFY:
+				{
+					xcb_unmap_notify_event_t *e = (xcb_unmap_notify_event_t *)ev;
+					DBG("[piewin] UNMAP_NOTIFY window=0x%08x (our=0x%08x)\n",
+					    (unsigned)e->window, (unsigned)app.win);
+					if (e->window == app.win) {
+						DBG("[piewin] Our window was unmapped (likely workspace switch); exiting\n");
+						exit_code = 1;
+						running = 0;
+					}
+				}
+				break;
+
 			case XCB_CLIENT_MESSAGE:
 				{
 					xcb_client_message_event_t *cm = (xcb_client_message_event_t *)ev;
