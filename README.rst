@@ -28,6 +28,14 @@ Notes
   without clipping, using Cairo text extents.
 - Hover highlight brightens the slice's background color.
 - Minimal latency design: small binary, direct XCB, immediate rendering.
+- **Single instance:** by default only one instance can run per user and X
+  ``$DISPLAY``. To allow multiple concurrent instances, pass ``-m`` /
+  ``--multiple`` on the command line.
+- **Keyboard navigation:** Arrow keys and ``hjkl`` cycle through entries; **Enter**
+  chooses the highlighted entry; **Esc** cancels. To disable all keyboard handling,
+  pass ``-nkb`` / ``--no-keyboard`` (mouse-only).
+- Extra debug prints are available when the ``DEBUG`` environment variable is
+  set to a non-empty and non-``0`` value.
 
 Dependencies
 ------------

@@ -19,13 +19,26 @@
 #include <errno.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <ctype.h>
+#include <sys/types.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 1024
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// XK_Escape without pulling in Xlib headers
-#define XK_Escape 0xff1b
+// Minimal keysym defines (avoid Xlib headers)
+#define XK_Escape   0xff1b
+#define XK_Return   0xff0d
+#define XK_KP_Enter 0xff8d
+#define XK_Left     0xff51
+#define XK_Up       0xff52
+#define XK_Right    0xff53
+#define XK_Down     0xff54
 
 // --- Debug helper -------------------------------------------------------
 static int dbg_enabled(void)
@@ -71,6 +84,55 @@ typedef struct
 	cairo_surface_t *bg_image;
 	int bg_w, bg_h;
 } App;
+
+// --- Single-instance lock helpers ---------------------------------------
+static void sanitize_display(const char *in, char *out, size_t outsz)
+{
+	if (!in) in = ":0";
+	size_t j = 0;
+	for (size_t i = 0; in[i] && j + 1 < outsz; ++i) {
+		unsigned char c = (unsigned char)in[i];
+		out[j++] = (isalnum(c) ? (char)c : '_');
+	}
+	if (j == 0 && outsz > 1) out[j++] = '0';
+	out[j] = '\0';
+}
+
+static int acquire_lockfile(const char *path)
+{
+	int fd = open(path, O_RDWR | O_CREAT, 0644);
+	if (fd < 0) {
+		DBG("[piewin] open lockfile failed: %s (%s)\n", path, strerror(errno));
+		return -1;
+	}
+	struct flock fl;
+	memset(&fl, 0, sizeof(fl));
+	fl.l_type = F_WRLCK;
+	fl.l_whence = SEEK_SET;
+	fl.l_start = 0;
+	fl.l_len = 0; // whole file
+
+	if (fcntl(fd, F_SETLK, &fl) == -1) {
+		int e = errno;
+		DBG("[piewin] fcntl(F_SETLK) failed on %s: %s\n", path, strerror(e));
+		if (e == EACCES || e == EAGAIN) {
+			// Someone else holds the lock.
+			close(fd);
+			return -2;
+		}
+		close(fd);
+		return -1;
+	}
+
+	// Write our PID for observability; ignore errors.
+	if (ftruncate(fd, 0) == 0) {
+		char buf[64];
+		int n = snprintf(buf, sizeof(buf), "%ld\n", (long)getpid());
+		if (n > 0) (void)write(fd, buf, (size_t)n);
+	}
+	DBG("[piewin] Acquired single-instance lock on %s\n", path);
+	return fd; // keep open until exit
+}
 
 static xcb_visualtype_t *find_visualtype(const xcb_screen_t *screen, xcb_visualid_t vid)
 {
@@ -375,9 +437,14 @@ static void usage(const char *argv0)
 	fprintf(stderr, "                        and do not restore it after exit.\n");
 	fprintf(stderr, "  -s, --screenshot      Use a dimmed screenshot as background and mark\n");
 	fprintf(stderr, "                        the original cursor position with a red circle.\n");
+	fprintf(stderr, "  -m, --multiple        Allow multiple instances (disables single-instance\n");
+	fprintf(stderr, "                        lock; by default only one instance per user and\n");
+	fprintf(stderr, "                        $DISPLAY can run).\n");
+	fprintf(stderr, "  -nkb, --no-keyboard   Disable all keyboard handling (Esc, arrows, hjkl,\n");
+	fprintf(stderr, "                        Enter). Mouse-only mode.\n");
 }
 
-static void grab_input(App *app)
+static void grab_input(App *app, int grab_keyboard)
 {
 	// Grab pointer to avoid click-through to underlying apps.
 	xcb_grab_pointer_cookie_t pc =
@@ -400,20 +467,24 @@ static void grab_input(App *app)
 		DBG("[piewin] Grab pointer: no reply\n");
 	}
 
-	// Also grab keyboard so Esc doesn't leak.
-	xcb_grab_keyboard_cookie_t kc =
-	    xcb_grab_keyboard(app->conn,
-	                      0,
-	                      app->win,
-	                      XCB_CURRENT_TIME,
-	                      XCB_GRAB_MODE_ASYNC,
-	                      XCB_GRAB_MODE_ASYNC);
-	xcb_grab_keyboard_reply_t *kr = xcb_grab_keyboard_reply(app->conn, kc, NULL);
-	if (kr) {
-		DBG("[piewin] Grab keyboard status=%u\n", kr->status);
-		free(kr);
+	// Optionally grab keyboard so Esc/hjkl/arrows don't leak.
+	if (grab_keyboard) {
+		xcb_grab_keyboard_cookie_t kc =
+		    xcb_grab_keyboard(app->conn,
+		                      0,
+		                      app->win,
+		                      XCB_CURRENT_TIME,
+		                      XCB_GRAB_MODE_ASYNC,
+		                      XCB_GRAB_MODE_ASYNC);
+		xcb_grab_keyboard_reply_t *kr = xcb_grab_keyboard_reply(app->conn, kc, NULL);
+		if (kr) {
+			DBG("[piewin] Grab keyboard status=%u\n", kr->status);
+			free(kr);
+		} else {
+			DBG("[piewin] Grab keyboard: no reply\n");
+		}
 	} else {
-		DBG("[piewin] Grab keyboard: no reply\n");
+		DBG("[piewin] Keyboard grab skipped (no-keyboard mode)\n");
 	}
 	xcb_flush(app->conn);
 }
@@ -529,6 +600,9 @@ int main(int argc, char **argv)
 {
 	int keep_mouse_pos = 0;
 	int use_screenshot_bg = 0;
+	int allow_multiple = 0;
+	int kb_enabled = 1;
+	int lock_fd = -1;
 
 	// Args
 	for (int i = 1; i < argc; ++i) {
@@ -539,6 +613,10 @@ int main(int argc, char **argv)
 			keep_mouse_pos = 1;
 		} else if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--screenshot")) {
 			use_screenshot_bg = 1;
+		} else if (!strcmp(argv[i], "-m") || !strcmp(argv[i], "--multiple")) {
+			allow_multiple = 1;
+		} else if (!strcmp(argv[i], "-nkb") || !strcmp(argv[i], "--no-keyboard")) {
+			kb_enabled = 0;
 		} else {
 			fprintf(stderr, "Unknown option: %s\n", argv[i]);
 			usage(argv[0]);
@@ -549,7 +627,34 @@ int main(int argc, char **argv)
 	DBG("[piewin] Debug logging enabled\n");
 	if (dbg_enabled()) {
 		fprintf(stderr, "[piewin] Cairo: %s\n", cairo_version_string());
-		fprintf(stderr, "[piewin] keep_mouse_pos=%d screenshot=%d\n", keep_mouse_pos, use_screenshot_bg);
+		fprintf(stderr, "[piewin] keep_mouse_pos=%d screenshot=%d allow_multiple=%d kb_enabled=%d\n",
+		        keep_mouse_pos, use_screenshot_bg, allow_multiple, kb_enabled);
+	}
+
+	// Single-instance lock (per user + DISPLAY), unless --multiple
+	if (!allow_multiple) {
+		char disp_s[128];
+		char disp_lock[PATH_MAX];
+		const char *disp = getenv("DISPLAY");
+		sanitize_display(disp ? disp : ":0", disp_s, sizeof(disp_s));
+		snprintf(disp_lock, sizeof(disp_lock), "/tmp/gzg-%u-%s.lock",
+		         (unsigned)getuid(), disp_s);
+		DBG("[piewin] Using lockfile %s (DISPLAY=%s)\n",
+		    disp_lock, disp ? disp : ":0");
+		int rv = acquire_lockfile(disp_lock);
+		if (rv == -2) {
+			fprintf(stderr,
+			        "Another instance appears to be running (lock %s).\n"
+			        "Use -m/--multiple to bypass single-instance mode.\n",
+			        disp_lock);
+			return 2;
+		} else if (rv < 0) {
+			fprintf(stderr, "Failed to acquire lock %s\n", disp_lock);
+			return 2;
+		}
+		lock_fd = rv;
+	} else {
+		DBG("[piewin] --multiple set; skipping single-instance lock\n");
 	}
 
 	// Read entries from stdin (fast, simple)
@@ -582,8 +687,10 @@ int main(int argc, char **argv)
 	}
 	free(line);
 
+	DBG("[piewin] Total entries read: %zu\n", count);
 	if (count == 0) {
 		DBG("[piewin] No entries on stdin; exiting 1\n");
+		if (lock_fd >= 0) close(lock_fd);
 		return 1;
 	}
 
@@ -592,6 +699,7 @@ int main(int argc, char **argv)
 	xcb_connection_t *conn = xcb_connect(NULL, &scrno);
 	if (xcb_connection_has_error(conn)) {
 		fprintf(stderr, "Failed to connect to X server.\n");
+		if (lock_fd >= 0) close(lock_fd);
 		return 1;
 	}
 	const xcb_setup_t *setup = xcb_get_setup(conn);
@@ -675,7 +783,7 @@ int main(int argc, char **argv)
 	recreate_cairo(&app);
 
 	// Grab input so clicks/keys don't leak to other apps
-	grab_input(&app);
+	grab_input(&app, kb_enabled);
 
 	// Handle pointer warp unless disabled
 	if (!keep_mouse_pos) {
@@ -686,10 +794,10 @@ int main(int argc, char **argv)
 		xcb_flush(conn);
 	}
 
-	int hover_idx = -1;
+	int sel_idx = -1;
 	int pressed_idx = -1;
 	DBG("[piewin] Initial draw %dx%d, entries=%zu\n", app.width, app.height, count);
-	draw(&app, entries, (int)count, hover_idx);
+	draw(&app, entries, (int)count, sel_idx);
 
 	int exit_code = 1;  // default to "cancel"
 	int running = 1;
@@ -703,7 +811,7 @@ int main(int argc, char **argv)
 			case XCB_EXPOSE:
 				{
 					DBG("[piewin] EXPOSE\n");
-					draw(&app, entries, (int)count, hover_idx);
+					draw(&app, entries, (int)count, sel_idx);
 				}
 				break;
 
@@ -711,10 +819,11 @@ int main(int argc, char **argv)
 				{
 					xcb_motion_notify_event_t *e = (xcb_motion_notify_event_t *)ev;
 					int idx = sector_index_from_point((int)count, app.width, app.height, e->event_x, e->event_y);
-					if (idx != hover_idx) {
-						DBG("[piewin] HOVER %d -> %d (x=%d y=%d)\n", hover_idx, idx, e->event_x, e->event_y);
-						hover_idx = idx;
-						draw(&app, entries, (int)count, hover_idx);
+					if (idx != sel_idx) {
+						DBG("[piewin] MOTION selects %d (from %d) at %d,%d\n",
+						    idx, sel_idx, e->event_x, e->event_y);
+						sel_idx = idx;
+						draw(&app, entries, (int)count, sel_idx);
 					}
 				}
 				break;
@@ -728,12 +837,11 @@ int main(int argc, char **argv)
 						pressed_idx = sector_index_from_point((int)count, app.width, app.height, e->event_x, e->event_y);
 						DBG("[piewin] PRESS on idx=%d -> SELECT & EXIT NOW\n", pressed_idx);
 						if (pressed_idx >= 0 && pressed_idx < (int)count) {
-							// Output selected entry to stdout immediately on press
 							fprintf(stdout, "%s\n", entries[pressed_idx].text);
 							fflush(stdout);
 							DBG("[piewin] SELECT idx=%d \"%s\"\n", pressed_idx, entries[pressed_idx].text);
 							exit_code = 0;
-							running = 0; // immediate termination requested
+							running = 0;
 						}
 					}
 				}
@@ -750,13 +858,53 @@ int main(int argc, char **argv)
 
 			case XCB_KEY_PRESS:
 				{
+					if (!kb_enabled) {
+						DBG("[piewin] KEY_PRESS ignored (no-keyboard mode)\n");
+						break;
+					}
 					xcb_key_press_event_t *e = (xcb_key_press_event_t *)ev;
 					xcb_keysym_t sym = xcb_key_symbols_get_keysym(app.keysyms, e->detail, 0);
 					DBG("[piewin] KEY_PRESS detail=%u sym=0x%08x\n", e->detail, (unsigned)sym);
+
 					if (sym == XK_Escape || sym == 'q' || sym == 'Q') {
 						DBG("[piewin] Quit key pressed (sym=0x%08x)\n", (unsigned)sym);
 						exit_code = 1;
 						running = 0;
+						break;
+					}
+
+					// Initialize selection if needed
+					if (sel_idx < 0 && (int)count > 0) sel_idx = 0;
+
+					int moved = 0;
+					// Prev
+					if (sym == XK_Left || sym == XK_Up || sym == 'h' || sym == 'k' || sym == 'H' || sym == 'K') {
+						if ((int)count > 0) {
+							sel_idx = (sel_idx - 1 + (int)count) % (int)count;
+							moved = 1;
+						}
+					}
+					// Next
+					if (sym == XK_Right || sym == XK_Down || sym == 'l' || sym == 'j' || sym == 'L' || sym == 'J') {
+						if ((int)count > 0) {
+							sel_idx = (sel_idx + 1) % (int)count;
+							moved = 1;
+						}
+					}
+					if (moved) {
+						DBG("[piewin] KEY NAV -> sel_idx=%d\n", sel_idx);
+						draw(&app, entries, (int)count, sel_idx);
+					}
+
+					// Enter to select
+					if (sym == XK_Return || sym == XK_KP_Enter) {
+						if (sel_idx >= 0 && sel_idx < (int)count) {
+							fprintf(stdout, "%s\n", entries[sel_idx].text);
+							fflush(stdout);
+							DBG("[piewin] ENTER -> SELECT idx=%d \"%s\"\n", sel_idx, entries[sel_idx].text);
+							exit_code = 0;
+							running = 0;
+						}
 					}
 				}
 				break;
@@ -771,7 +919,7 @@ int main(int argc, char **argv)
 						app.height = e->height;
 						DBG("[piewin] RESIZE -> %dx%d (recreate surfaces)\n", app.width, app.height);
 						recreate_cairo(&app);
-						draw(&app, entries, (int)count, hover_idx);
+						draw(&app, entries, (int)count, sel_idx);
 					}
 				}
 				break;
@@ -817,6 +965,10 @@ int main(int argc, char **argv)
 	for (size_t i = 0; i < count; ++i)
 		free(entries[i].text);
 	free(entries);
+	if (lock_fd >= 0) {
+		DBG("[piewin] Releasing single-instance lock (fd=%d)\n", lock_fd);
+		close(lock_fd);
+	}
 	DBG("[piewin] Exit code %d\n", exit_code);
 	return exit_code;
 }
