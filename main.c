@@ -317,7 +317,8 @@ static void draw(App *app, Entry *entries, int n, int hover_idx)
 		double r, g, b;
 		double base_v = (i == hover_idx) ? 0.95 : 0.75;
 		hsv_to_rgb((double)i / (double)n, 0.55, base_v, &r, &g, &b);
-		double alpha = (i == hover_idx) ? 0.80 : 0.55;
+		// double alpha = (i == hover_idx) ? 0.80 : 0.55;
+		double alpha = (i == hover_idx) ? 0.50 : 0.40;
 		cairo_set_source_rgba(cr, r, g, b, alpha);
 
 		cairo_new_path(cr);
@@ -794,7 +795,7 @@ int main(int argc, char **argv)
 		xcb_flush(conn);
 	}
 
-	int sel_idx = -1;
+	int sel_idx = (int)count - 1;
 	int pressed_idx = -1;
 	DBG("[piewin] Initial draw %dx%d, entries=%zu\n", app.width, app.height, count);
 	draw(&app, entries, (int)count, sel_idx);
