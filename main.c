@@ -10,6 +10,7 @@
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
 #include <xcb/xcb_keysyms.h>
+#include <xcb/xtest.h>
 #include <cairo/cairo.h>
 #include <cairo/cairo-xcb.h>
 #include <stdio.h>
@@ -22,6 +23,7 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <sys/types.h>
+#include <time.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -32,13 +34,21 @@
 #endif
 
 // Minimal keysym defines (avoid Xlib headers)
-#define XK_Escape   0xff1b
-#define XK_Return   0xff0d
-#define XK_KP_Enter 0xff8d
-#define XK_Left     0xff51
-#define XK_Up       0xff52
-#define XK_Right    0xff53
-#define XK_Down     0xff54
+#define XK_Escape    0xff1b
+#define XK_Return    0xff0d
+#define XK_KP_Enter  0xff8d
+#define XK_Left      0xff51
+#define XK_Up        0xff52
+#define XK_Right     0xff53
+#define XK_Down      0xff54
+#define XK_Tab       0xff09
+#define XK_space     0x0020
+#define XK_Shift_L   0xffe1
+#define XK_Control_L 0xffe3
+
+// Typing behavior
+#define TYPE_DELAY_MS         200   // sleep after close before typing
+#define TYPE_EVENT_DELAY_US   1000  // small delay between fake inputs
 
 // --- Debug helper -------------------------------------------------------
 static int dbg_enabled(void)
@@ -84,6 +94,14 @@ typedef struct
 	cairo_surface_t *bg_image;
 	int bg_w, bg_h;
 } App;
+
+static void sleep_ms(int ms)
+{
+	struct timespec ts;
+	ts.tv_sec = ms / 1000;
+	ts.tv_nsec = (ms % 1000) * 1000000L;
+	nanosleep(&ts, NULL);
+}
 
 // --- Single-instance lock helpers ---------------------------------------
 static void sanitize_display(const char *in, char *out, size_t outsz)
@@ -443,6 +461,9 @@ static void usage(const char *argv0)
 	fprintf(stderr, "                        $DISPLAY can run).\n");
 	fprintf(stderr, "  -nkb, --no-keyboard   Disable all keyboard handling (Esc, arrows, hjkl,\n");
 	fprintf(stderr, "                        Enter). Mouse-only mode.\n");
+	fprintf(stderr, "  -t, --type            Instead of printing selection to stdout, type it via\n");
+	fprintf(stderr, "                        XTEST virtual keypresses after closing. A small\n");
+	fprintf(stderr, "                        delay (%dms) is applied before typing.\n", TYPE_DELAY_MS);
 }
 
 static void grab_input(App *app, int grab_keyboard)
@@ -597,12 +618,164 @@ static cairo_surface_t *capture_dimmed_screenshot_with_cursor(App *app, int mous
 	return img;
 }
 
+// --- XTEST typing helpers -------------------------------------------------
+static void fake_key(App *app, uint8_t press, xcb_keycode_t kc)
+{
+	xcb_test_fake_input(app->conn, press ? XCB_KEY_PRESS : XCB_KEY_RELEASE,
+	                    kc, XCB_CURRENT_TIME, XCB_NONE, 0, 0, 0);
+	xcb_flush(app->conn);
+	usleep(TYPE_EVENT_DELAY_US);
+}
+
+static xcb_keycode_t first_keycode_for_keysym(App *app, xcb_keysym_t sym)
+{
+	xcb_keycode_t kc = 0;
+	xcb_keycode_t *arr = xcb_key_symbols_get_keycode(app->keysyms, sym);
+	if (arr) {
+		kc = arr[0];
+		free(arr);
+	}
+	return kc;
+}
+
+static int send_keysym_with_shift_if_needed(App *app, xcb_keysym_t sym)
+{
+	xcb_keycode_t kc = first_keycode_for_keysym(app, sym);
+	if (!kc) {
+		DBG("[type] No keycode for keysym 0x%08x\n", (unsigned)sym);
+		return 0;
+	}
+
+	xcb_keysym_t col0 = xcb_key_symbols_get_keysym(app->keysyms, kc, 0);
+	xcb_keysym_t col1 = xcb_key_symbols_get_keysym(app->keysyms, kc, 1);
+
+	int need_shift = (sym == col1 && sym != col0);
+	if (need_shift) {
+		xcb_keycode_t shift_kc = first_keycode_for_keysym(app, XK_Shift_L);
+		if (!shift_kc) {
+			DBG("[type] Shift keycode missing; cannot shift\n");
+			return 0;
+		}
+		fake_key(app, 1, shift_kc);
+		fake_key(app, 1, kc);
+		fake_key(app, 0, kc);
+		fake_key(app, 0, shift_kc);
+	} else {
+		fake_key(app, 1, kc);
+		fake_key(app, 0, kc);
+	}
+	return 1;
+}
+
+static int unicode_hex_input(App *app, uint32_t cp)
+{
+	// Ctrl+Shift+u, then hex digits, then Return
+	xcb_keycode_t ctrl_kc  = first_keycode_for_keysym(app, XK_Control_L);
+	xcb_keycode_t shift_kc = first_keycode_for_keysym(app, XK_Shift_L);
+	if (!ctrl_kc || !shift_kc) {
+		DBG("[type] Missing modifier keycodes for Ctrl/Shift\n");
+		return 0;
+	}
+
+	// Press Ctrl+Shift
+	fake_key(app, 1, ctrl_kc);
+	fake_key(app, 1, shift_kc);
+
+	// Press 'u'
+	if (!send_keysym_with_shift_if_needed(app, 'u')) {
+		DBG("[type] Could not send 'u' for Unicode preinput\n");
+	}
+
+	// Release modifiers
+	fake_key(app, 0, shift_kc);
+	fake_key(app, 0, ctrl_kc);
+
+	// Type lowercase hex
+	char hex[9];
+	snprintf(hex, sizeof(hex), "%x", cp);
+	for (char *p = hex; *p; ++p) {
+		if (!send_keysym_with_shift_if_needed(app, (xcb_keysym_t)*p)) {
+			DBG("[type] Failed sending hex digit '%c'\n", *p);
+		}
+	}
+
+	// Commit
+	if (!send_keysym_with_shift_if_needed(app, XK_Return)) {
+		DBG("[type] Failed sending Return to commit Unicode\n");
+	}
+	return 1;
+}
+
+static void type_utf8_string(App *app, const char *s)
+{
+	if (!s) return;
+
+	// Query XTEST just for logging
+	xcb_test_get_version_cookie_t vck = xcb_test_get_version(app->conn, 2, 2);
+	xcb_test_get_version_reply_t *vrep = xcb_test_get_version_reply(app->conn, vck, NULL);
+	if (vrep) {
+		DBG("[type] XTEST version %u.%u\n", vrep->major_version, vrep->minor_version);
+		free(vrep);
+	} else {
+		DBG("[type] XTEST version query failed\n");
+	}
+
+	DBG("[type] Typing string: \"%s\"\n", s);
+
+	const unsigned char *p = (const unsigned char *)s;
+	while (*p) {
+		uint32_t cp = 0xFFFD; // replacement
+		int len = 0;
+
+		if (p[0] < 0x80) { cp = p[0]; len = 1; }
+		else if ((p[0] & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+			cp = ((p[0] & 0x1F) << 6) | (p[1] & 0x3F); len = 2;
+		}
+		else if ((p[0] & 0xF0) == 0xE0 &&
+		         (p[1] & 0xC0) == 0x80 &&
+		         (p[2] & 0xC0) == 0x80) {
+			cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); len = 3;
+		}
+		else if ((p[0] & 0xF8) == 0xF0 &&
+		         (p[1] & 0xC0) == 0x80 &&
+		         (p[2] & 0xC0) == 0x80 &&
+		         (p[3] & 0xC0) == 0x80) {
+			cp = ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+			len = 4;
+		} else {
+			len = 1; // invalid byte; send replacement via hex path
+		}
+
+		int sent = 0;
+		if (cp == '\n') {
+			sent = send_keysym_with_shift_if_needed(app, XK_Return);
+		} else if (cp == '\t') {
+			sent = send_keysym_with_shift_if_needed(app, XK_Tab);
+		} else if (cp >= 0x20 && cp <= 0x7E) {
+			// Try ASCII directly (with Shift if needed)
+			sent = send_keysym_with_shift_if_needed(app, (xcb_keysym_t)cp);
+		} else {
+			// Fallback: Unicode hex input
+			sent = unicode_hex_input(app, cp);
+		}
+
+		if (!sent) {
+			DBG("[type] Fallback failed for U+%04X; skipping\n", cp);
+		}
+
+		p += len;
+	}
+	xcb_flush(app->conn);
+}
+
 int main(int argc, char **argv)
 {
 	int keep_mouse_pos = 0;
 	int use_screenshot_bg = 0;
 	int allow_multiple = 0;
 	int kb_enabled = 1;
+	int type_mode = 0;
+	char *type_text = NULL;
 	int lock_fd = -1;
 
 	// Args
@@ -618,6 +791,8 @@ int main(int argc, char **argv)
 			allow_multiple = 1;
 		} else if (!strcmp(argv[i], "-nkb") || !strcmp(argv[i], "--no-keyboard")) {
 			kb_enabled = 0;
+		} else if (!strcmp(argv[i], "-t") || !strcmp(argv[i], "--type")) {
+			type_mode = 1;
 		} else {
 			fprintf(stderr, "Unknown option: %s\n", argv[i]);
 			usage(argv[0]);
@@ -628,8 +803,9 @@ int main(int argc, char **argv)
 	DBG("[piewin] Debug logging enabled\n");
 	if (dbg_enabled()) {
 		fprintf(stderr, "[piewin] Cairo: %s\n", cairo_version_string());
-		fprintf(stderr, "[piewin] keep_mouse_pos=%d screenshot=%d allow_multiple=%d kb_enabled=%d\n",
-		        keep_mouse_pos, use_screenshot_bg, allow_multiple, kb_enabled);
+		fprintf(stderr,
+		        "[piewin] keep_mouse_pos=%d screenshot=%d allow_multiple=%d kb_enabled=%d type_mode=%d\n",
+		        keep_mouse_pos, use_screenshot_bg, allow_multiple, kb_enabled, type_mode);
 	}
 
 	// Single-instance lock (per user + DISPLAY), unless --multiple
@@ -838,9 +1014,14 @@ int main(int argc, char **argv)
 						pressed_idx = sector_index_from_point((int)count, app.width, app.height, e->event_x, e->event_y);
 						DBG("[piewin] PRESS on idx=%d -> SELECT & EXIT NOW\n", pressed_idx);
 						if (pressed_idx >= 0 && pressed_idx < (int)count) {
-							fprintf(stdout, "%s\n", entries[pressed_idx].text);
-							fflush(stdout);
-							DBG("[piewin] SELECT idx=%d \"%s\"\n", pressed_idx, entries[pressed_idx].text);
+							if (type_mode) {
+								type_text = strdup(entries[pressed_idx].text);
+								DBG("[piewin] (type mode) storing text: \"%s\"\n", type_text);
+							} else {
+								fprintf(stdout, "%s\n", entries[pressed_idx].text);
+								fflush(stdout);
+								DBG("[piewin] SELECT idx=%d \"%s\"\n", pressed_idx, entries[pressed_idx].text);
+							}
 							exit_code = 0;
 							running = 0;
 						}
@@ -900,9 +1081,14 @@ int main(int argc, char **argv)
 					// Enter to select
 					if (sym == XK_Return || sym == XK_KP_Enter) {
 						if (sel_idx >= 0 && sel_idx < (int)count) {
-							fprintf(stdout, "%s\n", entries[sel_idx].text);
-							fflush(stdout);
-							DBG("[piewin] ENTER -> SELECT idx=%d \"%s\"\n", sel_idx, entries[sel_idx].text);
+							if (type_mode) {
+								type_text = strdup(entries[sel_idx].text);
+								DBG("[piewin] (type mode) storing text: \"%s\"\n", type_text);
+							} else {
+								fprintf(stdout, "%s\n", entries[sel_idx].text);
+								fflush(stdout);
+								DBG("[piewin] ENTER -> SELECT idx=%d \"%s\"\n", sel_idx, entries[sel_idx].text);
+							}
 							exit_code = 0;
 							running = 0;
 						}
@@ -954,10 +1140,8 @@ int main(int argc, char **argv)
 		free(ev);
 	}
 
-	// Cleanup
+	// Cleanup grabs first (so focus returns) and close the window
 	ungrab_input(&app);
-
-	// Destroy window (close) before restoring pointer position
 	if (app.win) xcb_destroy_window(conn, app.win);
 	xcb_flush(conn);
 
@@ -968,12 +1152,24 @@ int main(int argc, char **argv)
 		xcb_flush(conn);
 	}
 
+	// If in type mode, wait a bit for focus to settle then type
+	if (type_mode && type_text && exit_code == 0) {
+		DBG("[piewin] Sleeping %dms before typing...\n", TYPE_DELAY_MS);
+		sleep_ms(TYPE_DELAY_MS);
+		type_utf8_string(&app, type_text);
+	}
+
 	if (app.cr) cairo_destroy(app.cr);
 	if (app.csurf) cairo_surface_destroy(app.csurf);
 	if (app.bufcr) cairo_destroy(app.bufcr);
 	if (app.bufsurf) cairo_surface_destroy(app.bufsurf);
 	if (app.bg_image) cairo_surface_destroy(app.bg_image);
+
+	// type_text consumed; free after typing
+	free(type_text);
+
 	if (app.keysyms) xcb_key_symbols_free(app.keysyms);
+
 	xcb_disconnect(conn);
 
 	for (size_t i = 0; i < count; ++i)
