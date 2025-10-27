@@ -103,6 +103,15 @@ static void sleep_ms(int ms)
 	nanosleep(&ts, NULL);
 }
 
+static void sleep_us(int us)
+{
+	if (us <= 0) return;
+	struct timespec ts;
+	ts.tv_sec = us / 1000000;
+	ts.tv_nsec = (long)(us % 1000000) * 1000L;
+	nanosleep(&ts, NULL);
+}
+
 // --- Single-instance lock helpers ---------------------------------------
 static void sanitize_display(const char *in, char *out, size_t outsz)
 {
@@ -621,10 +630,11 @@ static cairo_surface_t *capture_dimmed_screenshot_with_cursor(App *app, int mous
 // --- XTEST typing helpers -------------------------------------------------
 static void fake_key(App *app, uint8_t press, xcb_keycode_t kc)
 {
+	DBG("[type] fake %s kc=%u\n", press ? "press" : "release", (unsigned)kc);
 	xcb_test_fake_input(app->conn, press ? XCB_KEY_PRESS : XCB_KEY_RELEASE,
 	                    kc, XCB_CURRENT_TIME, XCB_NONE, 0, 0, 0);
 	xcb_flush(app->conn);
-	usleep(TYPE_EVENT_DELAY_US);
+	sleep_us(TYPE_EVENT_DELAY_US);
 }
 
 static xcb_keycode_t first_keycode_for_keysym(App *app, xcb_keysym_t sym)
@@ -669,6 +679,7 @@ static int send_keysym_with_shift_if_needed(App *app, xcb_keysym_t sym)
 
 static int unicode_hex_input(App *app, uint32_t cp)
 {
+	DBG("[type] unicode_hex_input U+%04X\n", cp);
 	// Ctrl+Shift+u, then hex digits, then Return
 	xcb_keycode_t ctrl_kc  = first_keycode_for_keysym(app, XK_Control_L);
 	xcb_keycode_t shift_kc = first_keycode_for_keysym(app, XK_Shift_L);
@@ -745,6 +756,8 @@ static void type_utf8_string(App *app, const char *s)
 		} else {
 			len = 1; // invalid byte; send replacement via hex path
 		}
+
+		DBG("[type] sending U+%04X\n", cp);
 
 		int sent = 0;
 		if (cp == '\n') {
