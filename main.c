@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include <sys/types.h>
 #include <time.h>
+#include <xcb/xkb.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -76,6 +77,7 @@ typedef struct
 	xcb_connection_t *conn;
 	xcb_screen_t *screen;
 	xcb_window_t win;
+	uint8_t min_keycode, max_keycode;
 	xcb_atom_t WM_PROTOCOLS;
 	xcb_atom_t WM_DELETE_WINDOW;
 	xcb_atom_t NET_WM_STATE;
@@ -93,6 +95,10 @@ typedef struct
 	// Background screenshot (optional)
 	cairo_surface_t *bg_image;
 	int bg_w, bg_h;
+
+	// Keyboard layout awareness
+	uint8_t active_group;
+	int xkb_available;
 } App;
 
 static void sleep_ms(int ms)
@@ -637,7 +643,70 @@ static void fake_key(App *app, uint8_t press, xcb_keycode_t kc)
 	sleep_us(TYPE_EVENT_DELAY_US);
 }
 
-static xcb_keycode_t first_keycode_for_keysym(App *app, xcb_keysym_t sym)
+static void refresh_active_group(App *app)
+{
+	app->active_group = 0;
+	if (!app->xkb_available) return;
+
+	xcb_xkb_get_state_cookie_t ck = xcb_xkb_get_state(app->conn, XCB_XKB_ID_USE_CORE_KBD);
+	xcb_xkb_get_state_reply_t *rep = xcb_xkb_get_state_reply(app->conn, ck, NULL);
+	if (!rep) {
+		DBG("[type] xkb_get_state failed; using group 0\n");
+		return;
+	}
+
+	app->active_group = rep->group;
+	DBG("[type] Active keyboard group: %u\n", (unsigned)app->active_group);
+	free(rep);
+}
+
+static void init_xkb(App *app)
+{
+	app->xkb_available = 0;
+	xcb_xkb_use_extension_cookie_t ck = xcb_xkb_use_extension(app->conn,
+	                                                          XCB_XKB_MAJOR_VERSION,
+	                                                          XCB_XKB_MINOR_VERSION);
+	xcb_xkb_use_extension_reply_t *rep = xcb_xkb_use_extension_reply(app->conn, ck, NULL);
+	if (!rep) {
+		DBG("[type] XKB use_extension reply failed; using group 0\n");
+		return;
+	}
+	if (!rep->supported) {
+		DBG("[type] XKB extension not supported; using group 0\n");
+		free(rep);
+		return;
+	}
+
+	app->xkb_available = 1;
+	free(rep);
+	refresh_active_group(app);
+}
+
+static void release_all_keys(App *app)
+{
+	// Defensive: release every keycode in the server-advertised range in case
+	// an event was dropped and a key is stuck repeating.
+	for (uint8_t kc = app->min_keycode; kc <= app->max_keycode; ++kc) {
+		xcb_test_fake_input(app->conn, XCB_KEY_RELEASE, kc,
+		                    XCB_CURRENT_TIME, XCB_NONE, 0, 0, 0);
+	}
+	xcb_flush(app->conn);
+}
+
+static void keysym_columns_for_group(App *app, xcb_keycode_t kc, int group, xcb_keysym_t *col0, xcb_keysym_t *col1)
+{
+	int base = group * 2;
+	*col0 = xcb_key_symbols_get_keysym(app->keysyms, kc, base);
+	*col1 = xcb_key_symbols_get_keysym(app->keysyms, kc, base + 1);
+
+	// If the requested group is out of range, fall back to group 0 mapping.
+	if (*col0 == XCB_NO_SYMBOL && *col1 == XCB_NO_SYMBOL && group != 0) {
+		*col0 = xcb_key_symbols_get_keysym(app->keysyms, kc, 0);
+		*col1 = xcb_key_symbols_get_keysym(app->keysyms, kc, 1);
+	}
+}
+
+static xcb_keycode_t first_keycode_for_keysym(App *app, xcb_keysym_t sym, int group)
 {
 	// Prefer a keycode whose first/shifted column already matches the
 	// requested keysym (avoids layout mixups like de-qwertz vs us-qwerty).
@@ -645,8 +714,8 @@ static xcb_keycode_t first_keycode_for_keysym(App *app, xcb_keysym_t sym)
 	xcb_keycode_t *arr = xcb_key_symbols_get_keycode(app->keysyms, sym);
 	if (arr) {
 		for (xcb_keycode_t *p = arr; *p; ++p) {
-			xcb_keysym_t col0 = xcb_key_symbols_get_keysym(app->keysyms, *p, 0);
-			xcb_keysym_t col1 = xcb_key_symbols_get_keysym(app->keysyms, *p, 1);
+			xcb_keysym_t col0 = 0, col1 = 0;
+			keysym_columns_for_group(app, *p, group, &col0, &col1);
 			if (col0 == sym || col1 == sym) {
 				kc = *p;
 				break;
@@ -658,20 +727,29 @@ static xcb_keycode_t first_keycode_for_keysym(App *app, xcb_keysym_t sym)
 	return kc;
 }
 
-static int send_keysym_with_shift_if_needed(App *app, xcb_keysym_t sym)
+static int send_keysym_with_shift_if_needed(App *app, xcb_keysym_t sym, int group)
 {
-	xcb_keycode_t kc = first_keycode_for_keysym(app, sym);
+	xcb_keycode_t kc = first_keycode_for_keysym(app, sym, group);
 	if (!kc) {
 		DBG("[type] No keycode for keysym 0x%08x\n", (unsigned)sym);
 		return 0;
 	}
 
-	xcb_keysym_t col0 = xcb_key_symbols_get_keysym(app->keysyms, kc, 0);
-	xcb_keysym_t col1 = xcb_key_symbols_get_keysym(app->keysyms, kc, 1);
+	xcb_keysym_t col0 = 0, col1 = 0;
+	keysym_columns_for_group(app, kc, group, &col0, &col1);
+
+	// If the keycode we found does not actually produce this keysym in the
+	// first two columns, bail so the caller can use Unicode fallback instead
+	// of typing the wrong character (e.g., y instead of z on qwertz).
+	if (sym != col0 && sym != col1) {
+		DBG("[type] keycode %u maps to col0=0x%08x col1=0x%08x (wanted 0x%08x)\n",
+		    (unsigned)kc, (unsigned)col0, (unsigned)col1, (unsigned)sym);
+		return 0;
+	}
 
 	int need_shift = (sym == col1 && sym != col0);
 	if (need_shift) {
-		xcb_keycode_t shift_kc = first_keycode_for_keysym(app, XK_Shift_L);
+		xcb_keycode_t shift_kc = first_keycode_for_keysym(app, XK_Shift_L, 0);
 		if (!shift_kc) {
 			DBG("[type] Shift keycode missing; cannot shift\n");
 			return 0;
@@ -687,12 +765,12 @@ static int send_keysym_with_shift_if_needed(App *app, xcb_keysym_t sym)
 	return 1;
 }
 
-static int unicode_hex_input(App *app, uint32_t cp)
+static int unicode_hex_input(App *app, uint32_t cp, int group)
 {
 	DBG("[type] unicode_hex_input U+%04X\n", cp);
 	// Ctrl+Shift+u, then hex digits, then Return
-	xcb_keycode_t ctrl_kc  = first_keycode_for_keysym(app, XK_Control_L);
-	xcb_keycode_t shift_kc = first_keycode_for_keysym(app, XK_Shift_L);
+	xcb_keycode_t ctrl_kc  = first_keycode_for_keysym(app, XK_Control_L, 0);
+	xcb_keycode_t shift_kc = first_keycode_for_keysym(app, XK_Shift_L, 0);
 	if (!ctrl_kc || !shift_kc) {
 		DBG("[type] Missing modifier keycodes for Ctrl/Shift\n");
 		return 0;
@@ -703,7 +781,7 @@ static int unicode_hex_input(App *app, uint32_t cp)
 	fake_key(app, 1, shift_kc);
 
 	// Press 'u'
-	if (!send_keysym_with_shift_if_needed(app, 'u')) {
+	if (!send_keysym_with_shift_if_needed(app, 'u', group)) {
 		DBG("[type] Could not send 'u' for Unicode preinput\n");
 	}
 
@@ -715,13 +793,13 @@ static int unicode_hex_input(App *app, uint32_t cp)
 	char hex[9];
 	snprintf(hex, sizeof(hex), "%x", cp);
 	for (char *p = hex; *p; ++p) {
-		if (!send_keysym_with_shift_if_needed(app, (xcb_keysym_t)*p)) {
+		if (!send_keysym_with_shift_if_needed(app, (xcb_keysym_t)*p, group)) {
 			DBG("[type] Failed sending hex digit '%c'\n", *p);
 		}
 	}
 
 	// Commit
-	if (!send_keysym_with_shift_if_needed(app, XK_Return)) {
+	if (!send_keysym_with_shift_if_needed(app, XK_Return, group)) {
 		DBG("[type] Failed sending Return to commit Unicode\n");
 	}
 	return 1;
@@ -730,6 +808,9 @@ static int unicode_hex_input(App *app, uint32_t cp)
 static void type_utf8_string(App *app, const char *s)
 {
 	if (!s) return;
+
+	refresh_active_group(app);
+	int group = (int)app->active_group;
 
 	// Query XTEST just for logging
 	xcb_test_get_version_cookie_t vck = xcb_test_get_version(app->conn, 2, 2);
@@ -771,15 +852,15 @@ static void type_utf8_string(App *app, const char *s)
 
 		int sent = 0;
 		if (cp == '\n') {
-			sent = send_keysym_with_shift_if_needed(app, XK_Return);
+			sent = send_keysym_with_shift_if_needed(app, XK_Return, group);
 		} else if (cp == '\t') {
-			sent = send_keysym_with_shift_if_needed(app, XK_Tab);
+			sent = send_keysym_with_shift_if_needed(app, XK_Tab, group);
 		} else if (cp >= 0x20 && cp <= 0x7E) {
 			// Try ASCII directly (with Shift if needed)
-			sent = send_keysym_with_shift_if_needed(app, (xcb_keysym_t)cp);
+			sent = send_keysym_with_shift_if_needed(app, (xcb_keysym_t)cp, group);
 		} else {
 			// Fallback: Unicode hex input
-			sent = unicode_hex_input(app, cp);
+			sent = unicode_hex_input(app, cp, group);
 		}
 
 		if (!sent) {
@@ -789,6 +870,7 @@ static void type_utf8_string(App *app, const char *s)
 		p += len;
 	}
 	xcb_flush(app->conn);
+	release_all_keys(app);
 }
 
 int main(int argc, char **argv)
@@ -918,6 +1000,8 @@ int main(int argc, char **argv)
 	app.screen = screen;
 	app.width = screen->width_in_pixels;
 	app.height = screen->height_in_pixels;
+	app.min_keycode = setup->min_keycode;
+	app.max_keycode = setup->max_keycode;
 	app.WM_PROTOCOLS = intern_atom(conn, "WM_PROTOCOLS", 0);
 	app.WM_DELETE_WINDOW = intern_atom(conn, "WM_DELETE_WINDOW", 0);
 	app.NET_WM_STATE = intern_atom(conn, "_NET_WM_STATE", 0);
@@ -926,6 +1010,7 @@ int main(int argc, char **argv)
 	app.WM_NAME_ATOM = intern_atom(conn, "WM_NAME", 0);
 	app.UTF8_STRING = intern_atom(conn, "UTF8_STRING", 1);
 	app.keysyms = xcb_key_symbols_alloc(conn);
+	init_xkb(&app);
 
 	// Always query pointer to know original position (for screenshot marker and/or restore)
 	int saved_root_x = 0, saved_root_y = 0;
