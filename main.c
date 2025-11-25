@@ -24,6 +24,8 @@
 #include <ctype.h>
 #include <sys/types.h>
 #include <time.h>
+#include <poll.h>
+#include <limits.h>
 #include <xcb/xkb.h>
 
 #ifndef PATH_MAX
@@ -116,6 +118,13 @@ static void sleep_us(int us)
 	ts.tv_sec = us / 1000000;
 	ts.tv_nsec = (long)(us % 1000000) * 1000L;
 	nanosleep(&ts, NULL);
+}
+
+static int64_t monotonic_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
 }
 
 // --- Single-instance lock helpers ---------------------------------------
@@ -479,6 +488,8 @@ static void usage(const char *argv0)
 	fprintf(stderr, "  -t, --type            Instead of printing selection to stdout, type it via\n");
 	fprintf(stderr, "                        XTEST virtual keypresses after closing. A small\n");
 	fprintf(stderr, "                        delay (%dms) is applied before typing.\n", TYPE_DELAY_MS);
+	fprintf(stderr, "      --timeout SEC     Exit after SEC seconds without selection\n");
+	fprintf(stderr, "                        (default: 10). Applies to all modes.\n");
 }
 
 static void grab_input(App *app, int grab_keyboard)
@@ -686,7 +697,10 @@ static void release_all_keys(App *app)
 {
 	// Defensive: release every keycode in the server-advertised range in case
 	// an event was dropped and a key is stuck repeating.
-	for (uint8_t kc = app->min_keycode; kc <= app->max_keycode; ++kc) {
+	if (!app->conn) return;
+	if (app->min_keycode > app->max_keycode) return;
+
+	for (int kc = (int)app->min_keycode; kc <= (int)app->max_keycode; ++kc) {
 		xcb_test_fake_input(app->conn, XCB_KEY_RELEASE, kc,
 		                    XCB_CURRENT_TIME, XCB_NONE, 0, 0, 0);
 	}
@@ -882,6 +896,7 @@ int main(int argc, char **argv)
 	int type_mode = 0;
 	char *type_text = NULL;
 	int lock_fd = -1;
+	double timeout_sec = 10.0;
 
 	// Args
 	for (int i = 1; i < argc; ++i) {
@@ -898,6 +913,18 @@ int main(int argc, char **argv)
 			kb_enabled = 0;
 		} else if (!strcmp(argv[i], "-t") || !strcmp(argv[i], "--type")) {
 			type_mode = 1;
+		} else if (!strcmp(argv[i], "--timeout")) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "--timeout requires an argument\n");
+				return 2;
+			}
+			char *end = NULL;
+			long v = strtol(argv[++i], &end, 10);
+			if (!end || *end || v <= 0 || v > 3600) {
+				fprintf(stderr, "Invalid --timeout value: %s\n", argv[i]);
+				return 2;
+			}
+			timeout_sec = (double)v;
 		} else {
 			fprintf(stderr, "Unknown option: %s\n", argv[i]);
 			usage(argv[0]);
@@ -909,8 +936,8 @@ int main(int argc, char **argv)
 	if (dbg_enabled()) {
 		fprintf(stderr, "[piewin] Cairo: %s\n", cairo_version_string());
 		fprintf(stderr,
-		        "[piewin] keep_mouse_pos=%d screenshot=%d allow_multiple=%d kb_enabled=%d type_mode=%d\n",
-		        keep_mouse_pos, use_screenshot_bg, allow_multiple, kb_enabled, type_mode);
+		        "[piewin] keep_mouse_pos=%d screenshot=%d allow_multiple=%d kb_enabled=%d type_mode=%d timeout=%.1fs\n",
+		        keep_mouse_pos, use_screenshot_bg, allow_multiple, kb_enabled, type_mode, timeout_sec);
 	}
 
 	// Single-instance lock (per user + DISPLAY), unless --multiple
@@ -1086,10 +1113,53 @@ int main(int argc, char **argv)
 
 	int exit_code = 1;  // default to "cancel"
 	int running = 1;
+	int xfd = xcb_get_file_descriptor(conn);
+	int64_t timeout_deadline_ns = monotonic_ns() + (int64_t)(timeout_sec * 1000000000.0);
 
 	while (running) {
-		xcb_generic_event_t *ev = xcb_wait_for_event(conn);
-		if (!ev) break;
+		// Enforce timeout even if no events arrive
+		int64_t now_ns = monotonic_ns();
+		if (now_ns >= timeout_deadline_ns) {
+			DBG("[piewin] Timeout reached; exiting\n");
+			exit_code = 1;
+			break;
+		}
+
+		// Drain queued events first
+		xcb_generic_event_t *ev = xcb_poll_for_event(conn);
+		if (!ev) {
+			int wait_ms = (int)((timeout_deadline_ns - now_ns + 999999LL) / 1000000LL);
+			if (wait_ms < 0) wait_ms = 0;
+
+			if (xfd >= 0) {
+				struct pollfd pfd = { .fd = xfd, .events = POLLIN, .revents = 0 };
+				int rv = poll(&pfd, 1, wait_ms);
+				if (rv == 0) {
+					DBG("[piewin] Timeout reached while idle; exiting\n");
+					exit_code = 1;
+					break;
+				} else if (rv < 0) {
+					if (errno == EINTR) continue;
+					DBG("[piewin] poll error: %s\n", strerror(errno));
+					exit_code = 1;
+					break;
+				}
+			} else {
+				// Fallback if no FD available from XCB
+				sleep_ms(wait_ms > 50 ? 50 : wait_ms);
+			}
+
+			ev = xcb_poll_for_event(conn);
+			if (!ev) {
+				int err = xcb_connection_has_error(conn);
+				if (err) {
+					DBG("[piewin] xcb connection error=%d\n", err);
+					exit_code = 1;
+					break;
+				}
+				continue;
+			}
+		}
 		uint8_t rt = ev->response_type & ~0x80;
 
 		switch (rt) {
@@ -1266,6 +1336,9 @@ int main(int argc, char **argv)
 		sleep_ms(TYPE_DELAY_MS);
 		type_utf8_string(&app, type_text);
 	}
+
+	// Extra safety: release any possible stuck keys before exiting
+	release_all_keys(&app);
 
 	if (app.cr) cairo_destroy(app.cr);
 	if (app.csurf) cairo_surface_destroy(app.csurf);
