@@ -639,10 +639,20 @@ static void fake_key(App *app, uint8_t press, xcb_keycode_t kc)
 
 static xcb_keycode_t first_keycode_for_keysym(App *app, xcb_keysym_t sym)
 {
+	// Prefer a keycode whose first/shifted column already matches the
+	// requested keysym (avoids layout mixups like de-qwertz vs us-qwerty).
 	xcb_keycode_t kc = 0;
 	xcb_keycode_t *arr = xcb_key_symbols_get_keycode(app->keysyms, sym);
 	if (arr) {
-		kc = arr[0];
+		for (xcb_keycode_t *p = arr; *p; ++p) {
+			xcb_keysym_t col0 = xcb_key_symbols_get_keysym(app->keysyms, *p, 0);
+			xcb_keysym_t col1 = xcb_key_symbols_get_keysym(app->keysyms, *p, 1);
+			if (col0 == sym || col1 == sym) {
+				kc = *p;
+				break;
+			}
+			if (!kc) kc = *p;
+		}
 		free(arr);
 	}
 	return kc;
