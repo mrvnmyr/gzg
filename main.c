@@ -751,6 +751,8 @@ static int send_keysym_with_shift_if_needed(App *app, xcb_keysym_t sym, int grou
 
 	xcb_keysym_t col0 = 0, col1 = 0;
 	keysym_columns_for_group(app, kc, group, &col0, &col1);
+	DBG("[type] group=%d sym=0x%08x kc=%u col0=0x%08x col1=0x%08x\n",
+	    group, (unsigned)sym, (unsigned)kc, (unsigned)col0, (unsigned)col1);
 
 	// If the keycode we found does not actually produce this keysym in the
 	// first two columns, bail so the caller can use Unicode fallback instead
@@ -825,6 +827,7 @@ static void type_utf8_string(App *app, const char *s)
 
 	refresh_active_group(app);
 	int group = (int)app->active_group;
+	DBG("[type] Typing with active group %d\n", group);
 
 	// Query XTEST just for logging
 	xcb_test_get_version_cookie_t vck = xcb_test_get_version(app->conn, 2, 2);
@@ -877,9 +880,7 @@ static void type_utf8_string(App *app, const char *s)
 			sent = unicode_hex_input(app, cp, group);
 		}
 
-		if (!sent) {
-			DBG("[type] Fallback failed for U+%04X; skipping\n", cp);
-		}
+		if (!sent) DBG("[type] Failed to send U+%04X; skipping\n", cp);
 
 		p += len;
 	}
