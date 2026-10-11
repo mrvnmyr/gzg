@@ -26,6 +26,7 @@
 #include <time.h>
 #include <poll.h>
 #include <limits.h>
+#include <signal.h>
 #include <xcb/xkb.h>
 
 #ifndef PATH_MAX
@@ -103,6 +104,8 @@ typedef struct
 	int xkb_available;
 } App;
 
+static volatile sig_atomic_t g_stop_sig = 0; // latched termination signal
+
 static void sleep_ms(int ms)
 {
 	struct timespec ts;
@@ -125,6 +128,30 @@ static int64_t monotonic_ns(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+
+static void handle_signal(int sig)
+{
+	g_stop_sig = sig;
+}
+
+static void install_signal_handlers(void)
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sigemptyset(&sa.sa_mask);
+	sa.sa_handler = handle_signal;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
+	sigaction(SIGQUIT, &sa, NULL);
+
+	// Avoid sudden death (and stuck grabs) when stdout is closed.
+	struct sigaction ign;
+	memset(&ign, 0, sizeof(ign));
+	sigemptyset(&ign.sa_mask);
+	ign.sa_handler = SIG_IGN;
+	sigaction(SIGPIPE, &ign, NULL);
 }
 
 // --- Single-instance lock helpers ---------------------------------------
@@ -899,6 +926,8 @@ int main(int argc, char **argv)
 	int lock_fd = -1;
 	double timeout_sec = 10.0;
 
+	install_signal_handlers();
+
 	// Args
 	for (int i = 1; i < argc; ++i) {
 		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -1118,6 +1147,12 @@ int main(int argc, char **argv)
 	int64_t timeout_deadline_ns = monotonic_ns() + (int64_t)(timeout_sec * 1000000000.0);
 
 	while (running) {
+		if (g_stop_sig) {
+			DBG("[piewin] Signal %d caught; exiting\n", g_stop_sig);
+			exit_code = 128 + g_stop_sig;
+			break;
+		}
+
 		// Enforce timeout even if no events arrive
 		int64_t now_ns = monotonic_ns();
 		if (now_ns >= timeout_deadline_ns) {
@@ -1140,7 +1175,13 @@ int main(int argc, char **argv)
 					exit_code = 1;
 					break;
 				} else if (rv < 0) {
-					if (errno == EINTR) continue;
+					if (errno == EINTR) {
+						if (g_stop_sig) {
+							exit_code = 128 + g_stop_sig;
+							running = 0;
+						}
+						continue;
+					}
 					DBG("[piewin] poll error: %s\n", strerror(errno));
 					exit_code = 1;
 					break;
@@ -1332,7 +1373,11 @@ int main(int argc, char **argv)
 	}
 
 	// If in type mode, wait a bit for focus to settle then type
-	if (type_mode && type_text && exit_code == 0) {
+	if (g_stop_sig && exit_code == 0) {
+		exit_code = 128 + g_stop_sig;
+	}
+
+	if (!g_stop_sig && type_mode && type_text && exit_code == 0) {
 		DBG("[piewin] Sleeping %dms before typing...\n", TYPE_DELAY_MS);
 		sleep_ms(TYPE_DELAY_MS);
 		type_utf8_string(&app, type_text);
